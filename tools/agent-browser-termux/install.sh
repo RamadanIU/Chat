@@ -131,12 +131,41 @@ if [ "${SOURCE_MODE}" = "local" ]; then
   cp "${SCRIPT_DIR}/daemon.js" "${SHIM_DIR}/daemon.js"
   cp "${SCRIPT_DIR}/cli.js"    "${SHIM_DIR}/cli.js"
 else
-  RAW="https://raw.githubusercontent.com/RamadanIU/Chat/main/tools/agent-browser-termux"
+  # raw.githubusercontent.com aggressively caches files for ~5min after a
+  # branch update. Use the codeload tarball at the current commit SHA
+  # instead — that's content-addressable and never stale.
+  REF="${AGENT_BROWSER_REF:-main}"
+  API="https://api.github.com/repos/RamadanIU/Chat/commits/${REF}"
+  info "Resolving commit SHA for ref ${REF} via ${API}"
+  SHA="$(curl -fsSL -H 'Accept: application/vnd.github.v3+json' "${API}" \
+    | grep -oE '"sha"[[:space:]]*:[[:space:]]*"[a-f0-9]{40}"' | head -1 \
+    | sed -E 's/.*"([a-f0-9]{40})".*/\1/')"
+  if [ -z "${SHA}" ]; then
+    warn "Could not resolve commit SHA, falling back to raw.githubusercontent.com (may be cached)"
+    RAW="https://raw.githubusercontent.com/RamadanIU/Chat/${REF}/tools/agent-browser-termux"
+  else
+    info "Using commit ${SHA:0:7}"
+    RAW="https://raw.githubusercontent.com/RamadanIU/Chat/${SHA}/tools/agent-browser-termux"
+  fi
   info "Downloading daemon.js / cli.js from ${RAW}"
-  curl -fsSL "${RAW}/daemon.js" -o "${SHIM_DIR}/daemon.js"
-  curl -fsSL "${RAW}/cli.js"    -o "${SHIM_DIR}/cli.js"
+  CB="cb=$(date +%s%N 2>/dev/null || date +%s)"
+  curl -fsSL "${RAW}/daemon.js?${CB}" -o "${SHIM_DIR}/daemon.js"
+  curl -fsSL "${RAW}/cli.js?${CB}"    -o "${SHIM_DIR}/cli.js"
 fi
 chmod +x "${SHIM_DIR}/daemon.js" "${SHIM_DIR}/cli.js"
+
+# ── Sanity check: ensure we got the current code, not a cached old copy ────
+if ! grep -q 'disable-web-security' "${SHIM_DIR}/daemon.js" 2>/dev/null; then
+  err "daemon.js does not contain the expected '--disable-web-security' arg."
+  err "  This usually means GitHub returned a cached old version of the file."
+  err "  Try again in a minute, or pin to the latest commit:"
+  err "    AGENT_BROWSER_REF=main bash <(curl -sL ${RAW}/install.sh?\$RANDOM)"
+  err "Or download manually with cache-buster:"
+  err "    curl -fsSL '${RAW}/daemon.js?force=\$RANDOM' -o ${SHIM_DIR}/daemon.js"
+  exit 7
+fi
+SHA1=$(node -e 'console.log(require("crypto").createHash("sha1").update(require("fs").readFileSync("'"${SHIM_DIR}"'/daemon.js")).digest("hex").slice(0,12))' 2>/dev/null || echo '?')
+info "daemon.js sha1: ${SHA1}"
 
 # ── Drop wrapper into bin dir ───────────────────────────────────────────────
 mkdir -p "${BIN_DIR}"
