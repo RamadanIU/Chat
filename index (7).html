@@ -4639,11 +4639,46 @@ button:disabled, .icon-btn:disabled, input:disabled, textarea:disabled {
         </div>
       </div><!-- /settings-card Голос -->
 
-      <!-- ══ СИСТЕМА ══ -->
+      <!-- ══ СИСТЕМНЫЙ ПРОМТ ══ -->
       <div class="settings-card">
         <button class="settings-card-header" onclick="toggleSettingsCard(this)">
-          <i data-lucide="sliders" class="settings-card-header-icon"></i>
-          <span class="settings-card-header-label">Система</span>
+          <i data-lucide="file-text" class="settings-card-header-icon"></i>
+          <span class="settings-card-header-label">Системный промт</span>
+          <i data-lucide="chevron-down" class="settings-card-chevron"></i>
+        </button>
+        <div class="settings-card-body">
+
+          <div class="setting-row" style="flex-direction:column;align-items:stretch;">
+            <label>Основной системный промт</label>
+            <textarea id="systemPromptEditor" class="input-modern" style="min-height:200px;max-height:500px;resize:vertical;font-family:var(--font-mono);font-size:11px;line-height:1.5;white-space:pre-wrap;overflow-y:auto;"></textarea>
+          </div>
+          <div style="display:flex;gap:8px;margin-top:6px;">
+            <button id="systemPromptResetBtn" class="input-modern" style="flex:0 0 auto;cursor:pointer;font-weight:600;display:flex;align-items:center;justify-content:center;gap:6px;font-size:11px;padding:7px 12px;">
+              <i data-lucide="rotate-ccw" style="width:12px;height:12px;"></i> Сбросить
+            </button>
+          </div>
+          <div class="settings-hint" style="margin-top:6px;">
+            Этот промт отправляется модели как системное сообщение. Изменения применяются при следующей отправке.
+          </div>
+
+          <div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--border-1);">
+            <div class="toggle-group">
+              <label class="toggle-switch">
+                <input type="checkbox" id="enableDelay">
+                <span class="toggle-slider"></span>
+              </label>
+              <span class="toggle-label">Задержка между ответами: <input type="number" id="delaySeconds" class="delay-input" min="1" max="60" value="10" /> сек</span>
+            </div>
+          </div>
+
+        </div>
+      </div><!-- /settings-card Системный промт -->
+
+      <!-- ══ НАВЫКИ ══ -->
+      <div class="settings-card">
+        <button class="settings-card-header" onclick="toggleSettingsCard(this)">
+          <i data-lucide="layers" class="settings-card-header-icon"></i>
+          <span class="settings-card-header-label">Навыки</span>
           <i data-lucide="chevron-down" class="settings-card-chevron"></i>
         </button>
         <div class="settings-card-body">
@@ -4654,16 +4689,8 @@ button:disabled, .icon-btn:disabled, input:disabled, textarea:disabled {
             <span class="skills-count-badge" id="skillsCountBadge" style="display:none;"></span>
           </button>
 
-          <div class="toggle-group">
-            <label class="toggle-switch">
-              <input type="checkbox" id="enableDelay">
-              <span class="toggle-slider"></span>
-            </label>
-            <span class="toggle-label">Задержка: <input type="number" id="delaySeconds" class="delay-input" min="1" max="60" value="10" /> сек</span>
-          </div>
-
         </div>
-      </div><!-- /settings-card Система -->
+      </div><!-- /settings-card Навыки -->
 
       <!-- ══ ИНСТРУМЕНТЫ (Tools) ══ -->
       <div class="settings-card">
@@ -4724,7 +4751,7 @@ button:disabled, .icon-btn:disabled, input:disabled, textarea:disabled {
       <div class="settings-card">
         <button class="settings-card-header" onclick="toggleSettingsCard(this)">
           <i data-lucide="hard-drive" class="settings-card-header-icon"></i>
-          <span class="settings-card-header-label">Workspace</span>
+          <span class="settings-card-header-label">Файловая система</span>
           <span class="ws-active-chip" id="wsActiveChip" style="display:none;"></span>
           <i data-lucide="chevron-down" class="settings-card-chevron"></i>
         </button>
@@ -5333,6 +5360,16 @@ function saveSettings() {
   localStorage.setItem('agent_delay_seconds', delaySeconds.toString());
   localStorage.setItem('agent_tts_provider', ttsProvider);
   localStorage.setItem('agent_tts_voice', ttsVoice);
+  // System prompt
+  const sysPromptEditor = document.getElementById('systemPromptEditor');
+  if (sysPromptEditor) {
+    const val = sysPromptEditor.value;
+    if (val && val !== DEFAULT_SYSTEM_PROMPT) {
+      localStorage.setItem('agent_custom_system_prompt', val);
+    } else {
+      localStorage.removeItem('agent_custom_system_prompt');
+    }
+  }
   // Terminal server
   const termHost = (document.getElementById('termHost').value || '').trim().replace(/\/+$/, '');
   const termCreds = document.getElementById('termCreds').value || '';
@@ -5437,6 +5474,12 @@ function loadSettings() {
   }
   document.getElementById('enableDelay').checked = enableDelay;
   document.getElementById('delaySeconds').value = delaySeconds;
+  // System prompt editor
+  const sysPromptEditor = document.getElementById('systemPromptEditor');
+  if (sysPromptEditor) {
+    const saved = localStorage.getItem('agent_custom_system_prompt');
+    sysPromptEditor.value = (saved !== null && saved !== '') ? saved : (typeof DEFAULT_SYSTEM_PROMPT !== 'undefined' ? DEFAULT_SYSTEM_PROMPT : '');
+  }
   document.getElementById('ttsProvider').value = ttsProvider;
   updateTtsVoiceOptions(ttsProvider);
   document.getElementById('ttsVoice').value = ttsVoice;
@@ -5465,6 +5508,13 @@ function loadSettings() {
 }
 document.getElementById('enableDelay').addEventListener('change', saveSettings);
 document.getElementById('delaySeconds').addEventListener('change', saveSettings);
+document.getElementById('systemPromptResetBtn')?.addEventListener('click', () => {
+  const editor = document.getElementById('systemPromptEditor');
+  if (editor) {
+    editor.value = DEFAULT_SYSTEM_PROMPT;
+    localStorage.removeItem('agent_custom_system_prompt');
+  }
+});
 document.getElementById('prompt').addEventListener('input', (e) => {
   localStorage.setItem('agent_last_prompt', e.target.value);
   // Auto-resize
@@ -10936,7 +10986,7 @@ function parseMarkdown(text) {
   return out;
 }
 /* ========= Отображение чата ========= */
-const SYSTEM_PROMPT = `You are a project-building agent with full access to a browser-based file workspace.
+const DEFAULT_SYSTEM_PROMPT = `You are a project-building agent with full access to a browser-based file workspace.
 
 YOUR TOOLS:
 
@@ -10994,6 +11044,12 @@ TIPS:
 - Chain browser commands for efficiency: open page → snapshot -i → click/fill → screenshot.
 - agent-browser is installed on the server. It runs a real Chromium headless browser.
 - You decide your own workflow. Plan if it helps, skip if the task is simple.`;
+
+function getSystemPrompt() {
+  const custom = localStorage.getItem('agent_custom_system_prompt');
+  return (custom !== null && custom !== '') ? custom : DEFAULT_SYSTEM_PROMPT;
+}
+
 function loadActiveChat() {
   const chat = ChatManager.getActive();
   if (!chat) return;
@@ -11650,7 +11706,7 @@ async function runAgent(userText) {
   const chat = ChatManager.getActive();
   if (!chat) return;
   const skillsAddition = (typeof SkillsEngine !== 'undefined') ? SkillsEngine.getSkillsListPrompt() : '';
-  const effectiveSystemPrompt = SYSTEM_PROMPT + skillsAddition;
+  const effectiveSystemPrompt = getSystemPrompt() + skillsAddition;
   if (chat.messages.length === 0 || chat.messages[0].role !== 'system') {
     chat.messages.unshift({ role: 'system', content: effectiveSystemPrompt });
   } else if (chat.messages[0].role === 'system') {
