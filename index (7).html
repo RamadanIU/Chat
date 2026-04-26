@@ -7703,7 +7703,7 @@ const toolDefs = [
     type: 'function',
     function: {
       name: 'browser_action',
-      description: 'Control a headless browser via agent-browser (Vercel Labs). Use for: web scraping, form filling, testing, screenshot capture, navigating sites, interacting with web pages. The browser runs on the remote server with full internet access.\n\nCommands:\n- open <url> — Open a URL\n- click <selector> — Click an element\n- type <selector> <text> — Type text into an element\n- fill <selector> <text> — Clear field and fill with text\n- press <key> — Press a key (Enter, Tab, etc)\n- screenshot [path] — Take a screenshot\n- screenshot --annotate — Screenshot with numbered labels for vision\n- snapshot — Get accessibility tree with ref-links (for AI)\n- snapshot -i — Get interactive elements only\n- eval <js> — Execute JavaScript on the page\n- wait <selector|ms> — Wait for element or time\n- get text [selector] — Get text content\n- get url — Get current URL\n- get title — Get page title\n- find role|text|label <value> <action> [text] — Find and interact with elements\n- set viewport <w> <h> — Set window size\n- tab new|list|close — Manage tabs\n- hover <selector> — Hover over element\n- mouse move <x> <y> — Move mouse\n- pdf <path> — Save page as PDF\n\nALWAYS start with "open <url>" before other commands. Use "snapshot -i" to see interactive elements on the page. Use "screenshot" to capture the current state. Chain multiple commands with && for complex workflows.',
+      description: 'Control a headless browser via agent-browser. Use for: web scraping, FORM FILLING (e.g. submitting university applications), uploading documents, UI testing, screenshot capture, navigating sites. The browser runs on the remote server with full internet access and a persistent session (cookies/login survive between calls).\n\nCommands:\n- open <url> [--wait load|domcontentloaded|networkidle]\n- back | forward | reload\n- snapshot -i — Get interactive elements with @e-refs (USE THIS FIRST after open)\n- click <selector|@ref> | dblclick | hover | focus\n- fill <selector|@ref> <text> — Clear and type text\n- type <selector|@ref> <text> [--delay ms] — Append text\n- press [<selector|@ref>] <key> — Enter, Tab, Escape, ArrowDown, etc.\n- upload <selector|@ref> <path> — Attach file to <input type=file>. Use ABSOLUTE paths or ~/path.\n- screenshot <path> [--full] [--clip x,y,w,h]\n- eval <js> | eval -b <base64-js> — Run JS in page; result printed as JSON\n- get url | get title | get text [<selector>] | get html [<selector>]\n- wait <selector|@ref> [timeout-ms] | wait timeout <ms> | wait load|domcontentloaded|networkidle\n- set viewport <w> <h>\n- tabs list | tabs new [url] | tabs switch <i> | tabs close <i>\n- cookies get [domain] | cookies clear\n- mouse move <x> <y> | mouse click <x> <y> | mouse wheel <dy>\n\nWORKFLOW for forms / document submission (e.g. university applications):\n1. open <url>\n2. snapshot -i — read the @e-refs and identify the right textbox/button/file inputs\n3. fill @eN <text> for each input field\n4. upload @eM <file-path> for file inputs (look for [file] tag in snapshot)\n5. click @eK on the submit button\n6. screenshot to verify result, or get text to extract confirmation\n\nSelectors: standard CSS, role=button[name="..."], text="...", or @e1/@e2 refs from snapshot.',
       parameters: {
         type: 'object',
         properties: {
@@ -10897,15 +10897,15 @@ File Operations:
 
 Execution:
 - run_terminal(command, cwd?) — execute a shell command on the remote Linux server. This is a REAL server with full internet access, bash, all coreutils, package managers (apt/npm/pip/etc.), git, docker, and any installed tools. Use for: installing packages (npm install, pip install), building projects, running servers, git operations, downloading files, compiling, testing, and any system-level tasks. The server persists between commands.
-- browser_action(command, description?) — control a headless browser via agent-browser (Vercel Labs). Use for web scraping, form filling, UI testing, screenshot capture, navigating websites, extracting data from web pages. The browser runs on the server with full internet access.
-  Workflow:
-  1. Open a page: browser_action(command: "open https://example.com")
-  2. Get interactive elements: browser_action(command: "snapshot -i")
-  3. Interact using ref-links from snapshot: browser_action(command: "click @e1") or browser_action(command: "fill @e2 search text")
-  4. Take screenshot for visual check: browser_action(command: "screenshot /tmp/page.png")
-  5. Get text/data: browser_action(command: "get text .results") or browser_action(command: "eval document.title")
-  Key commands: open, click, type, fill, press, screenshot, snapshot, eval, wait, get text|url|title, find, hover, set viewport, tab new|list|close, pdf
-  ALWAYS use "open <url>" first. Use "snapshot -i" to discover interactive elements. Use ref-links (@e1, @e2...) from snapshot for precise element targeting.
+- browser_action(command, description?) — control a headless browser via agent-browser. Persistent session: cookies, logins, form state survive across calls. Use for web scraping, form filling, UPLOADING DOCUMENTS (e.g. submitting applications to universities/government portals), navigation, screenshot capture.
+  Workflow for any form-based task:
+  1. open the URL: browser_action(command: "open https://example.com")
+  2. snapshot -i — list interactive elements with @e1, @e2... refs (textbox/button/file/checkbox/etc.)
+  3. fill @eN <text> for each field. Use upload @eM <path> for file inputs (marked [file] in snapshot).
+  4. click @eK on the submit button.
+  5. screenshot or get text/url to verify.
+  Key commands: open, back, forward, reload, snapshot -i, click, fill, type, press, upload, screenshot, eval, wait, get url|title|text|html, set viewport, tabs new|list|switch|close, cookies, hover, mouse move|click|wheel.
+  ALWAYS use "open <url>" first, then "snapshot -i" to discover interactive elements. Use refs (@e1, @e2...) from snapshot — they're more reliable than CSS selectors. For uploads, write the file to a known path first via run_terminal (e.g. ~/workspace/uploads/diplom.pdf), then upload @eN ~/workspace/uploads/diplom.pdf.
 - run_project(build?, serve, port, url?) — FULL BUILD PIPELINE. Runs build command via terminal, starts the serve command in background, waits for the server to be ready, then opens a live preview iframe. The server hostname is auto-detected from terminal server settings.
   Examples:
   • React/Vite prod:  build="npm install && npm run build", serve="npx serve dist -l {port}", port=3000
