@@ -8142,7 +8142,9 @@ const toolImpl = {
     const host = localStorage.getItem('agent_term_host') || '';
     if (!host) return { error: 'Терминал-сервер не настроен. Укажите URL в настройках → Терминал.', exit_code: 1 };
 
-    const SCREEN_PATH = '~/workspace/browser/screen.png';
+    // wsapi_server.py exposes ~/storage/shared/workspace as workspace root,
+    // so screenshots / uploads must live there to be visible to the chat VFS.
+    const SCREEN_PATH = '~/storage/shared/workspace/browser/screen.png';
 
     // UI: показываем что браузер работает
     BrowserPanel.setWorking(true, description || command);
@@ -8150,7 +8152,7 @@ const toolImpl = {
 
     try {
       // 1. Создаём папку если нет (один раз, тихо)
-      await TermEngine.execAgentCommand('mkdir -p ~/workspace/browser');
+      await TermEngine.execAgentCommand('mkdir -p ~/storage/shared/workspace/browser');
 
       // 2. Выполняем саму команду агента
       const fullCmd = `agent-browser ${command.trim()}`;
@@ -10905,7 +10907,7 @@ Execution:
   4. click @eK on the submit button.
   5. screenshot or get text/url to verify.
   Key commands: open, back, forward, reload, snapshot -i, click, fill, type, press, upload, screenshot, eval, wait, get url|title|text|html, set viewport, tabs new|list|switch|close, cookies, hover, mouse move|click|wheel.
-  ALWAYS use "open <url>" first, then "snapshot -i" to discover interactive elements. Use refs (@e1, @e2...) from snapshot — they're more reliable than CSS selectors. For uploads, write the file to a known path first via run_terminal (e.g. ~/workspace/uploads/diplom.pdf), then upload @eN ~/workspace/uploads/diplom.pdf.
+  ALWAYS use "open <url>" first, then "snapshot -i" to discover interactive elements. Use refs (@e1, @e2...) from snapshot — they're more reliable than CSS selectors. For uploads, write the file to a known path first via run_terminal (e.g. ~/storage/shared/workspace/browser/uploads/diplom.pdf), then upload @eN ~/storage/shared/workspace/browser/uploads/diplom.pdf.
 - run_project(build?, serve, port, url?) — FULL BUILD PIPELINE. Runs build command via terminal, starts the serve command in background, waits for the server to be ready, then opens a live preview iframe. The server hostname is auto-detected from terminal server settings.
   Examples:
   • React/Vite prod:  build="npm install && npm run build", serve="npx serve dist -l {port}", port=3000
@@ -13095,8 +13097,10 @@ function renderTerminalWidget(command, result) {
 
 /* ========= BROWSER PANEL ENGINE (Interactive) ========= */
 const BrowserPanel = (() => {
-  const SCREEN_PATH = '~/workspace/browser/screen.png';
-  const UPLOADS_DIR = '~/workspace/browser/uploads';
+  // wsapi_server.py serves ~/storage/shared/workspace as workspace root,
+  // so the screenshot / upload paths live there (not in ~/workspace).
+  const SCREEN_PATH = '~/storage/shared/workspace/browser/screen.png';
+  const UPLOADS_DIR = '~/storage/shared/workspace/browser/uploads';
   // Default desktop viewport — большой и удобный для работы с сайтами.
   // Для мобильной вкладки используем телефонный профиль.
   const DESKTOP_VIEWPORT = { w: 1280, h: 800 };
@@ -13168,7 +13172,7 @@ const BrowserPanel = (() => {
     const { w, h } = viewportFor(isMobileLayout() ? 'mobile' : 'desktop');
     try {
       await execBrowser(`set viewport ${w} ${h}`);
-      await exec('mkdir -p ~/workspace/browser ~/workspace/browser/uploads');
+      await exec('mkdir -p ~/storage/shared/workspace/browser ~/storage/shared/workspace/browser/uploads');
     } catch(_) {}
   }
 
