@@ -135,7 +135,13 @@ async function _ensureBrowserInner() {
   // surface that with a clearer message than Playwright's "Target ... has been closed".
   browser.on('disconnected', () => { log('browser disconnected'); });
 
-  const ctxOpts = { viewport, ignoreHTTPSErrors: true };
+  // Keep newContext options minimal — the user's tested test-launch.js
+  // calls browser.newPage() with no explicit context options. Adding
+  // viewport / ignoreHTTPSErrors here has been observed to cause
+  // net::ERR_ABORTED on Termux Chromium 138 even with --disable-web-security.
+  // Apply viewport later via page.setViewportSize() so the initial
+  // navigation runs in the most-default state possible.
+  const ctxOpts = {};
   if (fs.existsSync(STORAGE_STATE_FILE)) {
     try {
       const raw = fs.readFileSync(STORAGE_STATE_FILE, 'utf8');
@@ -177,6 +183,8 @@ async function _ensureBrowserInner() {
     const p0 = await context.newPage();
     pages = [p0];
     activeIndex = 0;
+    // Best-effort viewport — if Termux Chromium can't honour it, we still navigate.
+    try { await p0.setViewportSize(viewport); } catch (e) { log('setViewportSize failed (non-fatal):', e.message); }
   } catch (e) {
     log('newPage failed', e && (e.stack || e.message || e));
     throw new Error('newPage failed: ' + (e && e.message ? e.message : String(e))
