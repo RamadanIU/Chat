@@ -137,6 +137,21 @@ agent-browser kill && agent-browser open about:blank
 
 Chromium стартовал но сразу умер. Проверьте, что ваш родной `node ~/playwright-termux/test-launch.js` работает — он использует ровно те же аргументы, что и шим. Если родной тест работает, а шим нет — пришлите вывод `cat ~/.cache/agent-browser/daemon.log`. Если родной тоже падает — проблема в самом Chromium / Playwright-core.
 
+### `net::ERR_ABORTED` при `agent-browser open`
+
+Базовые args шима уже включают `--disable-web-security`, что обычно решает эту проблему на Termux Chromium 138 (так рекомендует ваш скилл). Если всё равно падает:
+
+1. Проверьте, что у вас актуальная версия шима:
+   ```bash
+   grep -c disable-web-security ~/playwright-termux/agent-browser-shim/daemon.js
+   ```
+   Должно вывести `2`. Если `0` — скрипт `install.sh` скачал устаревшую копию из кеша GitHub. Перекачайте напрямую с cache-busting:
+   ```bash
+   agent-browser kill
+   curl -fsSL "https://raw.githubusercontent.com/RamadanIU/Chat/main/tools/agent-browser-termux/daemon.js?$(date +%s)" -o ~/playwright-termux/agent-browser-shim/daemon.js
+   ```
+2. Перезапустите демон: `agent-browser kill && agent-browser open https://example.com`.
+
 ### `setInputFiles` падает
 
 Это значит, что переданный селектор не указывает на `<input type=file>` или элемент скрыт. Сделайте `snapshot -i`, найдите ref с пометкой `[file]`, и `agent-browser upload @e7 ~/file.pdf`.
