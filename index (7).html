@@ -3283,12 +3283,166 @@ select.input-modern { background-image: url("data:image/svg+xml,%3Csvg xmlns='ht
 .browser-action-entry .ba-text { flex: 1; word-break: break-word; }
 .browser-action-entry .ba-time { flex-shrink: 0; font-size: 9px; color: var(--text-3); }
 
+/* ===== INTERACTIVE BROWSER CONTROLS ===== */
+.browser-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 8px;
+  background: var(--bg-1);
+  border-bottom: 1px solid var(--border-0);
+  flex-shrink: 0;
+}
+.browser-nav-btn {
+  width: 24px; height: 24px;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--bg-2);
+  border: 1px solid var(--border-0);
+  border-radius: 4px;
+  color: var(--text-1);
+  cursor: pointer;
+  transition: all var(--transition);
+  flex-shrink: 0;
+  padding: 0;
+}
+.browser-nav-btn:hover:not(:disabled) {
+  background: var(--bg-3);
+  color: var(--text-0);
+  border-color: var(--border-focus);
+}
+.browser-nav-btn:active { transform: scale(0.92); }
+.browser-nav-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+.browser-nav-btn svg { width: 12px; height: 12px; }
+.browser-url-form {
+  flex: 1;
+  display: flex;
+  gap: 4px;
+  min-width: 0;
+}
+.browser-url-input {
+  flex: 1;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  padding: 4px 8px;
+  background: var(--bg-2);
+  border: 1px solid var(--border-0);
+  border-radius: 4px;
+  color: var(--text-0);
+  outline: none;
+  min-width: 0;
+}
+.browser-url-input:focus {
+  border-color: var(--border-focus);
+  background: var(--bg-3);
+}
+
+.browser-input-bar {
+  display: flex;
+  gap: 4px;
+  padding: 5px 8px;
+  background: var(--bg-1);
+  border-top: 1px solid var(--border-0);
+  flex-shrink: 0;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.browser-text-input {
+  flex: 1;
+  font-size: 11px;
+  padding: 4px 8px;
+  background: var(--bg-2);
+  border: 1px solid var(--border-0);
+  border-radius: 4px;
+  color: var(--text-0);
+  outline: none;
+  min-width: 80px;
+}
+.browser-text-input:focus { border-color: var(--info); background: var(--bg-3); }
+.browser-key-btn {
+  font-size: 9px;
+  padding: 4px 7px;
+  background: var(--bg-2);
+  border: 1px solid var(--border-0);
+  border-radius: 3px;
+  color: var(--text-1);
+  cursor: pointer;
+  font-family: var(--font-mono);
+  flex-shrink: 0;
+  transition: all var(--transition);
+  min-width: 26px;
+}
+.browser-key-btn:hover { background: var(--bg-3); color: var(--text-0); border-color: var(--border-focus); }
+.browser-key-btn:active { transform: scale(0.94); }
+.browser-key-btn.primary {
+  background: rgba(88,166,255,0.12);
+  color: var(--info);
+  border-color: rgba(88,166,255,0.25);
+}
+.browser-key-btn.primary:hover { background: rgba(88,166,255,0.2); }
+
+.browser-screen-wrap {
+  position: relative;
+  width: 100%;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  overflow: auto;
+  padding: 6px;
+  background: var(--bg-0);
+  -webkit-overflow-scrolling: touch;
+}
+.browser-screen-wrap img.browser-screen {
+  cursor: crosshair;
+  user-select: none;
+  -webkit-user-drag: none;
+  display: block;
+  max-width: 100%;
+  height: auto;
+  border-radius: var(--r-md);
+  border: 1px solid var(--border-0);
+  background: #fff;
+  transition: opacity 0.15s;
+}
+.browser-screen-wrap.loading img.browser-screen { opacity: 0.7; }
+.browser-click-ripple {
+  position: absolute;
+  pointer-events: none;
+  width: 20px; height: 20px;
+  border: 2px solid var(--info);
+  border-radius: 50%;
+  transform: translate(-50%, -50%);
+  animation: clickRipple 0.45s ease-out forwards;
+  z-index: 5;
+}
+@keyframes clickRipple {
+  0% { opacity: 1; transform: translate(-50%,-50%) scale(0.4); }
+  100% { opacity: 0; transform: translate(-50%,-50%) scale(2.2); }
+}
+.browser-overlay-busy {
+  position: absolute;
+  top: 10px; right: 10px;
+  font-size: 9px;
+  color: var(--info);
+  background: rgba(0,0,0,0.7);
+  padding: 3px 8px;
+  border-radius: 4px;
+  font-family: var(--font-mono);
+  pointer-events: none;
+  z-index: 6;
+  display: none;
+}
+.browser-screen-wrap.loading .browser-overlay-busy { display: block; }
+
+.browser-file-input { display: none; }
+
 /* ===== BROWSER OVERLAY (desktop) ===== */
 .browser-overlay {
   display: none;
   position: fixed;
   top: 36px; left: 0;
-  width: min(560px, 100vw);
+  width: min(940px, 100vw);
   height: calc(100vh - 36px);
   background: var(--bg-0);
   border-right: 1px solid var(--border-0);
@@ -4145,19 +4299,36 @@ button:disabled, .icon-btn:disabled, input:disabled, textarea:disabled {
       <span class="browser-status-dot" id="browserDotMobile"></span>
       <div class="browser-panel-title">
         <i data-lucide="globe"></i>
-        Agent Browser
+        Browser
       </div>
-      <span class="browser-url-badge" id="browserUrlMobile">--</span>
-      <span class="browser-step-count" style="font-size:9px;color:var(--text-3);font-family:var(--font-mono);flex-shrink:0;"></span>
-      <button class="term-header-btn" id="browserRefreshBtnMobile" title="Обновить скриншот">
-        <i data-lucide="refresh-cw"></i>
-      </button>
+      <span class="browser-step-count" style="font-size:9px;color:var(--text-3);font-family:var(--font-mono);flex-shrink:0;margin-left:auto;"></span>
+    </div>
+    <div class="browser-toolbar">
+      <button class="browser-nav-btn" data-bp-act="back" title="Назад"><i data-lucide="arrow-left"></i></button>
+      <button class="browser-nav-btn" data-bp-act="forward" title="Вперёд"><i data-lucide="arrow-right"></i></button>
+      <button class="browser-nav-btn" data-bp-act="reload" title="Обновить страницу"><i data-lucide="refresh-cw"></i></button>
+      <form class="browser-url-form" data-bp-form="url-mobile" autocomplete="off">
+        <input type="text" class="browser-url-input" data-bp-url-input id="browserUrlInputMobile"
+               placeholder="Введите URL и нажмите Enter…" spellcheck="false" autocapitalize="off" />
+      </form>
+      <button class="browser-nav-btn" data-bp-act="screenshot" title="Сделать скриншот"><i data-lucide="camera"></i></button>
     </div>
     <div class="browser-panel-body" id="browserBodyMobile">
       <div class="browser-empty-state">
         <div class="browser-empty-state-icon"><i data-lucide="globe"></i></div>
-        Браузер агента неактивен.<br>Агент откроет страницу при выполнении задачи.
+        Введите URL выше — откроется страница.<br>Управляйте кликом по экрану и вводом текста.
       </div>
+    </div>
+    <div class="browser-input-bar" data-bp-input-bar>
+      <input type="text" class="browser-text-input" data-bp-text-input id="browserTextInputMobile"
+             placeholder="Текст для активного поля…" autocomplete="off" autocapitalize="off" />
+      <button class="browser-key-btn primary" data-bp-act="send-text" title="Печатать текст в активный элемент">Type</button>
+      <button class="browser-key-btn" data-bp-act="press" data-key="Enter" title="Нажать Enter">⏎</button>
+      <button class="browser-key-btn" data-bp-act="press" data-key="Tab" title="Tab">Tab</button>
+      <button class="browser-key-btn" data-bp-act="press" data-key="Backspace" title="Backspace">⌫</button>
+      <button class="browser-key-btn" data-bp-act="press" data-key="Escape" title="Esc">Esc</button>
+      <button class="browser-key-btn" data-bp-act="upload" title="Прикрепить файл к ближайшему file-input">📎</button>
+      <input type="file" class="browser-file-input" data-bp-file-input />
     </div>
   </div>
 
@@ -4766,22 +4937,40 @@ button:disabled, .icon-btn:disabled, input:disabled, textarea:disabled {
     <span class="browser-status-dot" id="browserDot"></span>
     <div class="browser-panel-title">
       <i data-lucide="globe"></i>
-      Agent Browser
+      Browser
     </div>
-    <span class="browser-url-badge" id="browserUrlDesktop">--</span>
-    <span class="browser-step-count" style="font-size:9px;color:var(--text-3);font-family:var(--font-mono);flex-shrink:0;"></span>
-    <button class="term-header-btn" id="browserRefreshBtn" title="Обновить скриншот">
-      <i data-lucide="refresh-cw"></i> Refresh
-    </button>
+    <span class="browser-step-count" style="font-size:9px;color:var(--text-3);font-family:var(--font-mono);flex-shrink:0;margin-left:auto;"></span>
     <button class="term-header-btn danger" id="browserCloseBtn" title="Закрыть">
       <i data-lucide="x"></i>
     </button>
   </div>
+  <div class="browser-toolbar">
+    <button class="browser-nav-btn" data-bp-act="back" title="Назад"><i data-lucide="arrow-left"></i></button>
+    <button class="browser-nav-btn" data-bp-act="forward" title="Вперёд"><i data-lucide="arrow-right"></i></button>
+    <button class="browser-nav-btn" data-bp-act="reload" title="Обновить страницу"><i data-lucide="refresh-cw"></i></button>
+    <form class="browser-url-form" data-bp-form="url-desktop" autocomplete="off">
+      <input type="text" class="browser-url-input" data-bp-url-input id="browserUrlInputDesktop"
+             placeholder="Введите URL и нажмите Enter…" spellcheck="false" autocapitalize="off" />
+    </form>
+    <button class="browser-nav-btn" data-bp-act="screenshot" title="Сделать скриншот"><i data-lucide="camera"></i></button>
+    <button class="browser-nav-btn" data-bp-act="snapshot" title="Снимок дерева для AI (snapshot -i)"><i data-lucide="scan"></i></button>
+  </div>
   <div class="browser-panel-body" id="browserBodyDesktop">
     <div class="browser-empty-state">
       <div class="browser-empty-state-icon"><i data-lucide="globe"></i></div>
-      Браузер агента неактивен.<br>Агент откроет страницу при выполнении задачи.
+      Введите URL выше — откроется страница.<br>Кликайте по элементам, печатайте в формы, прикрепляйте файлы.
     </div>
+  </div>
+  <div class="browser-input-bar" data-bp-input-bar>
+    <input type="text" class="browser-text-input" data-bp-text-input id="browserTextInputDesktop"
+           placeholder="Текст для активного поля… (Enter — отправить)" autocomplete="off" autocapitalize="off" />
+    <button class="browser-key-btn primary" data-bp-act="send-text" title="Печатать текст в активный элемент">Type</button>
+    <button class="browser-key-btn" data-bp-act="press" data-key="Enter" title="Нажать Enter">⏎ Enter</button>
+    <button class="browser-key-btn" data-bp-act="press" data-key="Tab" title="Tab">Tab</button>
+    <button class="browser-key-btn" data-bp-act="press" data-key="Backspace" title="Backspace">⌫</button>
+    <button class="browser-key-btn" data-bp-act="press" data-key="Escape" title="Esc">Esc</button>
+    <button class="browser-key-btn" data-bp-act="upload" title="Прикрепить файл к ближайшему file-input">📎 Файл</button>
+    <input type="file" class="browser-file-input" data-bp-file-input />
   </div>
   <div class="browser-action-log" id="browserActionLog"></div>
 </div>
@@ -7973,13 +8162,12 @@ const toolImpl = {
         BrowserPanel.setUrl(openMatch[1]);
       }
 
-      // 4. ТИХИЙ АВТО-СКРИНШОТ — LLM об этом не знает
-      //    Viewport 390x844 (мобильный) — вертикальное фото, удобно и на ПК и на телефоне
-      //    Всегда перезаписываем один и тот же файл
+      // 4. ТИХИЙ АВТО-СКРИНШОТ — viewport инициализируется один раз
+      //    BrowserPanel.ensureViewport() ставит 1280x800 (десктоп) или 414x896 (моб.)
+      //    однократно за сессию, чтобы агент не сбрасывал размер страницы.
       try {
-        await TermEngine.execAgentCommand('agent-browser set viewport 390 844');
+        await BrowserPanel.ensureViewport();
         await TermEngine.execAgentCommand(`agent-browser screenshot ${SCREEN_PATH}`);
-        // Подгружаем URL если не было open
         if (!openMatch) {
           const urlRes = await TermEngine.execAgentCommand('agent-browser get url 2>/dev/null');
           if (urlRes?.stdout?.trim()) BrowserPanel.setUrl(urlRes.stdout.trim());
@@ -12223,6 +12411,7 @@ function initMobileTabs() {
     document.getElementById(panelId)?.classList.add('active');
     document.querySelectorAll('.mobile-tab').forEach(tab => tab.classList.toggle('active', tab.dataset.target === panelId));
     localStorage.setItem('agent_active_mobile_tab', panelId);
+    document.dispatchEvent(new CustomEvent('mobiletab:change', { detail: { panelId } }));
     
     // Body class for CSS-based input hiding
     document.body.className = document.body.className.replace(/panel-\w+/g, '').trim();
@@ -12904,23 +13093,85 @@ function renderTerminalWidget(command, result) {
   smartScroll(chatlog);
 }
 
-/* ========= BROWSER PANEL ENGINE ========= */
+/* ========= BROWSER PANEL ENGINE (Interactive) ========= */
 const BrowserPanel = (() => {
   const SCREEN_PATH = '~/workspace/browser/screen.png';
+  const UPLOADS_DIR = '~/workspace/browser/uploads';
+  // Default desktop viewport — большой и удобный для работы с сайтами.
+  // Для мобильной вкладки используем телефонный профиль.
+  const DESKTOP_VIEWPORT = { w: 1280, h: 800 };
+  const MOBILE_VIEWPORT  = { w: 414,  h: 896 };
+
   let currentUrl = '';
+  let lastTitle = '';
   let working = false;
-  let actionLog = [];  // лог действий для десктоп-панели
+  let actionLog = [];
   let _stepCounter = 0;
+  let _viewportInited = false;
+  let _pollHandle = null;
+  let _busyDepth = 0;
+  let _lastClickAt = null; // {x, y} viewport-coords последнего клика — для контекстного upload
+
+  function isMobileLayout() {
+    return window.matchMedia && window.matchMedia('(max-width: 768px)').matches;
+  }
+
+  function viewportFor(scope) {
+    return scope === 'mobile' ? MOBILE_VIEWPORT : DESKTOP_VIEWPORT;
+  }
 
   function setUrl(url) {
     currentUrl = url || '';
-    document.querySelectorAll('#browserUrlDesktop, #browserUrlMobile').forEach(el => {
-      el.textContent = currentUrl || '--';
-      el.title = currentUrl;
+    document.querySelectorAll('[data-bp-url-input]').forEach(el => {
+      if (document.activeElement !== el) el.value = currentUrl || '';
     });
   }
 
-  /** Загрузить screen.png с сервера через VFS и показать во вкладке */
+  function setWorking(isWorking) {
+    working = !!isWorking;
+    document.querySelectorAll('#browserDot, #browserDotMobile').forEach(el => {
+      el.className = 'browser-status-dot' + (isWorking ? ' working' : (currentUrl ? ' active' : ''));
+    });
+    document.querySelectorAll('.browser-screen-wrap').forEach(el => {
+      el.classList.toggle('loading', isWorking);
+    });
+  }
+
+  function _busy(on) {
+    _busyDepth += on ? 1 : -1;
+    if (_busyDepth < 0) _busyDepth = 0;
+    setWorking(_busyDepth > 0);
+  }
+
+  /** Безопасная отправка agent-browser команды с base64-eval поддержкой */
+  async function exec(cmd, opts = {}) {
+    const host = (window.localStorage && localStorage.getItem('agent_term_host')) || '';
+    if (!host) return { error: 'Терминал-сервер не настроен.', exit_code: 1 };
+    return await TermEngine.execAgentCommand(cmd, opts.cwd || '');
+  }
+
+  async function execBrowser(args, opts = {}) {
+    return await exec(`agent-browser ${args}`, opts);
+  }
+
+  /** Выполнить произвольный JS на странице через eval -b (base64) — безопасно для любых символов. */
+  async function evalJs(jsCode) {
+    const b64 = (typeof btoa === 'function')
+      ? btoa(unescape(encodeURIComponent(jsCode)))
+      : Buffer.from(jsCode, 'utf8').toString('base64');
+    return await execBrowser(`eval -b ${b64}`);
+  }
+
+  async function ensureViewport() {
+    if (_viewportInited) return;
+    _viewportInited = true;
+    const { w, h } = viewportFor(isMobileLayout() ? 'mobile' : 'desktop');
+    try {
+      await execBrowser(`set viewport ${w} ${h}`);
+      await exec('mkdir -p ~/workspace/browser ~/workspace/browser/uploads');
+    } catch(_) {}
+  }
+
   async function loadScreenshot() {
     try {
       if (!VFS.isConnected()) return;
@@ -12931,33 +13182,366 @@ const BrowserPanel = (() => {
       ['browserBodyDesktop', 'browserBodyMobile'].forEach(id => {
         const body = document.getElementById(id);
         if (!body) return;
-        let img = body.querySelector('img.browser-screen');
-        if (!img) {
+        let wrap = body.querySelector('.browser-screen-wrap');
+        if (!wrap) {
           body.innerHTML = '';
-          img = document.createElement('img');
-          img.className = 'browser-screen';
-          img.alt = 'Browser view';
-          img.style.cssText = 'max-width:100%;border-radius:var(--r-md);border:1px solid var(--border-0);transition:opacity 0.15s;';
-          body.appendChild(img);
+          body.style.padding = '0';
+          body.style.alignItems = 'stretch';
+          body.style.justifyContent = 'stretch';
+          wrap = document.createElement('div');
+          wrap.className = 'browser-screen-wrap';
+          wrap.innerHTML = `
+            <img class="browser-screen" alt="Browser view" draggable="false" />
+            <div class="browser-overlay-busy">обновление…</div>
+          `;
+          body.appendChild(wrap);
+          _attachInteractionHandlers(wrap);
         }
-        img.style.opacity = '0.5';
-        img.onload = () => { img.style.opacity = '1'; };
+        const img = wrap.querySelector('img.browser-screen');
         img.src = dataUrl;
       });
       document.querySelectorAll('.browser-step-count').forEach(el => {
         el.textContent = `#${_stepCounter}`;
       });
-    } catch(_) { /* файла ещё нет — нормально */ }
+    } catch(_) {}
   }
 
-  function setWorking(isWorking) {
-    working = isWorking;
-    document.querySelectorAll('#browserDot, #browserDotMobile').forEach(el => {
-      el.className = 'browser-status-dot' + (isWorking ? ' working' : (currentUrl ? ' active' : ''));
+  /** Координаты клика → viewport-координаты страницы (учитываем CSS-масштабирование img) */
+  function _eventToViewport(e, img) {
+    const rect = img.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return null;
+    const isMobile = img.closest('#browserPanelMobile') !== null;
+    const vp = viewportFor(isMobile ? 'mobile' : 'desktop');
+    // Используем naturalWidth/Height если доступны, иначе viewport — на случай retina-снимков.
+    const srcW = img.naturalWidth || vp.w;
+    const srcH = img.naturalHeight || vp.h;
+    // Скриншот всегда совпадает по соотношению с viewport, но может быть retina.
+    // Преобразуем точку клика в координаты viewport (CSS-пиксели) — туда стреляет mouse move.
+    const px = ((e.clientX - rect.left) / rect.width)  * vp.w;
+    const py = ((e.clientY - rect.top)  / rect.height) * vp.h;
+    return {
+      x: Math.max(0, Math.min(vp.w - 1, Math.round(px))),
+      y: Math.max(0, Math.min(vp.h - 1, Math.round(py))),
+      // Заодно вернём CSS-координаты внутри img — для рисования ripple
+      cssX: e.clientX - rect.left,
+      cssY: e.clientY - rect.top,
+    };
+  }
+
+  function _showRipple(wrap, cssX, cssY) {
+    const r = document.createElement('div');
+    r.className = 'browser-click-ripple';
+    r.style.left = cssX + 'px';
+    r.style.top = cssY + 'px';
+    wrap.appendChild(r);
+    setTimeout(() => r.remove(), 500);
+  }
+
+  function _attachInteractionHandlers(wrap) {
+    const img = wrap.querySelector('img.browser-screen');
+    if (!img) return;
+
+    // Click — реальный mouse down/up по координатам через agent-browser
+    img.addEventListener('click', async (e) => {
+      e.preventDefault();
+      const p = _eventToViewport(e, img);
+      if (!p) return;
+      _showRipple(wrap, p.cssX, p.cssY);
+      await clickAt(p.x, p.y);
     });
+
+    // Контекст-меню: правый клик — для перенаправления в правую кнопку (опционально)
+    img.addEventListener('contextmenu', async (e) => {
+      e.preventDefault();
+      const p = _eventToViewport(e, img);
+      if (!p) return;
+      _showRipple(wrap, p.cssX, p.cssY);
+      await clickAt(p.x, p.y, { button: 'right' });
+    });
+
+    // Wheel — прокручиваем страницу через mouse wheel
+    let wheelAccum = 0;
+    let wheelTimer = null;
+    img.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      const p = _eventToViewport(e, img);
+      if (!p) return;
+      wheelAccum += e.deltaY;
+      clearTimeout(wheelTimer);
+      wheelTimer = setTimeout(async () => {
+        const dy = Math.round(wheelAccum);
+        wheelAccum = 0;
+        if (Math.abs(dy) < 5) return;
+        await scrollBy(p.x, p.y, dy);
+      }, 80);
+    }, { passive: false });
+
+    // Touch swipe — для мобильной вкладки
+    let touchStart = null;
+    img.addEventListener('touchstart', (e) => {
+      if (e.touches.length !== 1) return;
+      const t = e.touches[0];
+      touchStart = { x: t.clientX, y: t.clientY, time: Date.now() };
+    }, { passive: true });
+    img.addEventListener('touchend', async (e) => {
+      if (!touchStart) return;
+      const t = e.changedTouches[0];
+      const dx = t.clientX - touchStart.x;
+      const dy = t.clientY - touchStart.y;
+      const dt = Date.now() - touchStart.time;
+      const dist = Math.hypot(dx, dy);
+      const synth = { clientX: touchStart.x, clientY: touchStart.y };
+      if (dist < 8 && dt < 350) {
+        // Tap — клик в исходную точку
+        const p = _eventToViewport(synth, img);
+        if (p) {
+          _showRipple(wrap, p.cssX, p.cssY);
+          await clickAt(p.x, p.y);
+        }
+      } else if (dist >= 8) {
+        // Swipe — скролл (инвертированно: свайп вверх = скролл вниз)
+        const p = _eventToViewport(synth, img);
+        if (p) await scrollBy(p.x, p.y, -dy);
+      }
+      touchStart = null;
+    }, { passive: true });
   }
 
-  /** Добавить запись в лог действий */
+  // ═══ Высокоуровневые действия ═══════════════════════════════════════════
+
+  async function openUrl(url) {
+    if (!url || !url.trim()) return;
+    let u = url.trim();
+    // Простейшая эвристика: если нет протокола и нет точки — это поисковый запрос
+    if (!/^[a-z]+:\/\//i.test(u)) {
+      if (/^[\w.-]+\.[a-z]{2,}(\/.*)?$/i.test(u) || /^localhost(:\d+)?(\/.*)?$/i.test(u)) {
+        u = 'https://' + u;
+      } else {
+        u = 'https://duckduckgo.com/?q=' + encodeURIComponent(u);
+      }
+    }
+    _busy(true);
+    addAction('open ' + u);
+    try {
+      await ensureViewport();
+      await execBrowser(`open ${JSON.stringify(u)}`);
+      setUrl(u);
+      await snapAndLoad();
+    } catch(e) {
+      addAction('error: ' + e.message);
+    } finally {
+      _busy(false);
+    }
+  }
+
+  async function back() {
+    _busy(true);
+    addAction('back');
+    try { await execBrowser('back'); await snapAndLoad(); }
+    finally { _busy(false); }
+  }
+
+  async function forward() {
+    _busy(true);
+    addAction('forward');
+    try { await execBrowser('forward'); await snapAndLoad(); }
+    finally { _busy(false); }
+  }
+
+  async function reload() {
+    _busy(true);
+    addAction('reload');
+    try { await execBrowser('reload'); await snapAndLoad(); }
+    finally { _busy(false); }
+  }
+
+  async function clickAt(x, y, opts = {}) {
+    _busy(true);
+    _lastClickAt = { x, y };
+    const button = opts.button || 'left';
+    addAction(`click ${x},${y}` + (button !== 'left' ? ' [' + button + ']' : ''));
+    try {
+      await ensureViewport();
+      // Реальный mouse-click на координатах: move → down → up
+      await execBrowser(`mouse move ${x} ${y}`);
+      await execBrowser(`mouse down ${button}`);
+      await execBrowser(`mouse up ${button}`);
+      // Небольшая задержка чтобы DOM успел отреагировать
+      await new Promise(r => setTimeout(r, 120));
+      await snapAndLoad();
+    } catch(e) {
+      addAction('error: ' + e.message);
+    } finally {
+      _busy(false);
+    }
+  }
+
+  async function scrollBy(x, y, deltaY) {
+    _busy(true);
+    addAction(`scroll ${deltaY > 0 ? 'down' : 'up'} ${Math.abs(deltaY)}`);
+    try {
+      await execBrowser(`mouse move ${x} ${y}`);
+      await execBrowser(`mouse wheel ${Math.round(deltaY)}`);
+      await new Promise(r => setTimeout(r, 80));
+      await snapAndLoad();
+    } finally { _busy(false); }
+  }
+
+  /** Печатает текст в активный элемент. Использует prototype-setter для совместимости с React. */
+  async function typeText(text) {
+    if (!text) return;
+    _busy(true);
+    addAction(`type "${text.length > 40 ? text.slice(0, 40) + '…' : text}"`);
+    try {
+      // Через eval -b: вставить текст в document.activeElement или contenteditable
+      const js = `
+        (function(){
+          var t = ${JSON.stringify(text)};
+          var el = document.activeElement;
+          if (!el || el === document.body) {
+            // Попробуем найти видимый input/textarea с фокусом
+            el = document.querySelector('input:focus, textarea:focus, [contenteditable=true]:focus');
+          }
+          if (!el) return 'no-active-element';
+          if (el.isContentEditable) {
+            el.focus();
+            document.execCommand('insertText', false, t);
+            return 'contenteditable:'+el.tagName;
+          }
+          if ('value' in el) {
+            try {
+              var proto = Object.getPrototypeOf(el);
+              var desc = Object.getOwnPropertyDescriptor(proto, 'value');
+              var setter = desc && desc.set;
+              var newVal = (el.value || '') + t;
+              if (setter) setter.call(el, newVal); else el.value = newVal;
+            } catch(_) {
+              el.value = (el.value || '') + t;
+            }
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            return el.tagName + ':' + (el.value||'').length;
+          }
+          return 'unsupported:' + el.tagName;
+        })()
+      `;
+      await evalJs(js);
+      await new Promise(r => setTimeout(r, 80));
+      await snapAndLoad();
+    } catch(e) {
+      addAction('error: ' + e.message);
+    } finally {
+      _busy(false);
+    }
+  }
+
+  async function pressKey(key) {
+    if (!key) return;
+    _busy(true);
+    addAction('press ' + key);
+    try {
+      await execBrowser(`press ${key}`);
+      await new Promise(r => setTimeout(r, 120));
+      await snapAndLoad();
+    } catch(e) {
+      addAction('error: ' + e.message);
+    } finally {
+      _busy(false);
+    }
+  }
+
+  /** Загрузка файла: VFS → uploads/ → agent-browser upload @ref */
+  async function uploadFile(file) {
+    if (!file) return;
+    _busy(true);
+    addAction('upload ' + file.name);
+    try {
+      // 1) Читаем файл как base64 и пишем в VFS
+      const buf = await file.arrayBuffer();
+      const u8 = new Uint8Array(buf);
+      let bin = '';
+      const chunk = 0x8000;
+      for (let i = 0; i < u8.length; i += chunk) {
+        bin += String.fromCharCode.apply(null, u8.subarray(i, i + chunk));
+      }
+      const b64 = btoa(bin);
+      // безопасное имя файла (без пробелов и спецсимволов)
+      const safeName = file.name.replace(/[^A-Za-z0-9._-]+/g, '_');
+      const vfsPath = 'browser/uploads/' + safeName;
+      await VFS.write(vfsPath, b64, { encoding: 'base64', mode: 'overwrite' });
+      const remotePath = `${UPLOADS_DIR}/${safeName}`;
+
+      // 2) Найти ref ближайшего file-input. Сначала пробуем активный элемент,
+      //    затем — самый близкий к последнему клику.
+      const findRefJs = `
+        (function(){
+          function rectOf(el){ try { var r = el.getBoundingClientRect(); return {x:r.left+r.width/2, y:r.top+r.height/2}; } catch(_) { return null; } }
+          var inputs = Array.from(document.querySelectorAll('input[type=file]'));
+          if (!inputs.length) return JSON.stringify({error:'no-file-input'});
+          // Помечаем data-ab-id чтобы найти потом через snapshot
+          inputs.forEach(function(el,i){ el.setAttribute('data-ab-upload-id', 'u'+i); });
+          var pick = inputs[0];
+          if (document.activeElement && document.activeElement.matches && document.activeElement.matches('input[type=file]')) {
+            pick = document.activeElement;
+          } else if (window.__bp_lastClick) {
+            var lc = window.__bp_lastClick;
+            var best = null, bestD = 1e12;
+            inputs.forEach(function(el){
+              var c = rectOf(el); if (!c) return;
+              var d = Math.hypot(c.x-lc.x, c.y-lc.y);
+              if (d < bestD) { bestD = d; best = el; }
+            });
+            if (best) pick = best;
+          }
+          return JSON.stringify({ id: pick.getAttribute('data-ab-upload-id'), name: pick.getAttribute('name')||'', total: inputs.length });
+        })()
+      `;
+      // Сохраним последний клик в окне страницы — для контекстного выбора
+      if (_lastClickAt) {
+        await evalJs(`window.__bp_lastClick = ${JSON.stringify(_lastClickAt)};`);
+      }
+      const findRes = await evalJs(findRefJs);
+      let info = null;
+      try {
+        const out = (findRes.stdout || '').trim();
+        const m = out.match(/\{.*\}/);
+        if (m) info = JSON.parse(m[0]);
+      } catch(_) {}
+
+      if (info && info.error) {
+        addAction('upload: на странице нет <input type=file>');
+        return;
+      }
+
+      // 3) Используем CSS-селектор через `agent-browser upload` с обычным CSS:
+      //    upload <selector> <file...>. Селектор привязываем к нашему data-атрибуту.
+      const selector = `input[type=file][data-ab-upload-id="${info ? info.id : 'u0'}"]`;
+      const upRes = await execBrowser(
+        `upload ${JSON.stringify(selector)} ${JSON.stringify(remotePath)}`
+      );
+      if (upRes && upRes.exit_code !== 0) {
+        addAction('upload error: ' + (upRes.stdout || upRes.error || 'exit ' + upRes.exit_code));
+      } else {
+        addAction('uploaded → ' + (info?.name || selector));
+      }
+      await snapAndLoad();
+    } catch(e) {
+      addAction('upload error: ' + e.message);
+    } finally {
+      _busy(false);
+    }
+  }
+
+  /** Один скриншот + обновление URL + загрузка в UI */
+  async function snapAndLoad() {
+    try {
+      await execBrowser(`screenshot ${SCREEN_PATH}`);
+      const urlRes = await execBrowser('get url 2>/dev/null');
+      if (urlRes?.stdout?.trim()) setUrl(urlRes.stdout.trim());
+      await loadScreenshot();
+    } catch(_) {}
+  }
+
   function addAction(cmdText) {
     const time = new Date().toLocaleTimeString('ru-RU', { hour:'2-digit', minute:'2-digit', second:'2-digit' });
     actionLog.push({ text: cmdText, time });
@@ -12966,7 +13550,6 @@ const BrowserPanel = (() => {
     if (!log) return;
     const entry = document.createElement('div');
     entry.className = 'browser-action-entry';
-    // Иконка по типу команды
     const cmd = cmdText.toLowerCase().trim();
     let icon = 'zap';
     if (cmd.startsWith('open')) icon = 'globe';
@@ -12974,10 +13557,14 @@ const BrowserPanel = (() => {
     else if (cmd.startsWith('type') || cmd.startsWith('fill')) icon = 'keyboard';
     else if (cmd.startsWith('screenshot')) icon = 'camera';
     else if (cmd.startsWith('snapshot')) icon = 'scan';
-    else if (cmd.startsWith('get')) icon = 'download';
-    else if (cmd.startsWith('eval')) icon = 'code';
-    else if (cmd.startsWith('wait')) icon = 'clock';
+    else if (cmd.startsWith('upload')) icon = 'upload';
+    else if (cmd.startsWith('scroll')) icon = 'mouse';
+    else if (cmd.startsWith('back')) icon = 'arrow-left';
+    else if (cmd.startsWith('forward')) icon = 'arrow-right';
+    else if (cmd.startsWith('reload')) icon = 'refresh-cw';
     else if (cmd.startsWith('press')) icon = 'corner-down-left';
+    else if (cmd.startsWith('eval')) icon = 'code';
+    else if (cmd.startsWith('error')) icon = 'alert-triangle';
     entry.innerHTML = `<span class="ba-icon"><i data-lucide="${icon}" style="width:10px;height:10px;"></i></span><span class="ba-text">${escapeHtml(cmdText)}</span><span class="ba-time">${time}</span>`;
     log.appendChild(entry);
     log.scrollTop = log.scrollHeight;
@@ -12987,32 +13574,136 @@ const BrowserPanel = (() => {
   function openPanel() {
     document.getElementById('browserOverlay')?.classList.add('open');
     document.getElementById('browserToggleBtn')?.classList.add('active');
-    loadScreenshot(); // обновить при открытии
+    loadScreenshot();
+    startPolling();
   }
 
   function closePanel() {
     document.getElementById('browserOverlay')?.classList.remove('open');
     document.getElementById('browserToggleBtn')?.classList.remove('active');
+    stopPolling();
   }
 
   function isOpen() {
-    return document.getElementById('browserOverlay')?.classList.contains('open') ?? false;
+    const desktopOpen = document.getElementById('browserOverlay')?.classList.contains('open') ?? false;
+    const mobileOpen = document.getElementById('browserPanelMobile')?.classList.contains('active') ?? false;
+    return desktopOpen || mobileOpen;
   }
 
-  /** Ручное обновление — кнопка Refresh */
+  function startPolling() {
+    if (_pollHandle) return;
+    _pollHandle = setInterval(() => {
+      if (!isOpen()) { stopPolling(); return; }
+      if (working) return; // не дёргаем во время своих команд
+      // Лёгкое обновление: только перечитать screen.png если он изменился
+      VFS.getRaw('browser/screen.png').then(raw => {
+        if (!raw || !raw.content) return;
+        const dataUrl = 'data:image/png;base64,' + raw.content;
+        document.querySelectorAll('img.browser-screen').forEach(img => {
+          if (img.src !== dataUrl) img.src = dataUrl;
+        });
+      }).catch(() => {});
+    }, 2500);
+  }
+
+  function stopPolling() {
+    if (_pollHandle) { clearInterval(_pollHandle); _pollHandle = null; }
+  }
+
+  /** Manual screenshot button — без побочной навигации */
   async function refreshScreenshot() {
-    setWorking(true);
+    _busy(true);
+    addAction('screenshot');
     try {
-      await TermEngine.execAgentCommand('mkdir -p ~/workspace/browser');
-      await TermEngine.execAgentCommand('agent-browser set viewport 390 844');
-      await TermEngine.execAgentCommand(`agent-browser screenshot ${SCREEN_PATH}`);
-      // Обновляем URL
-      const urlRes = await TermEngine.execAgentCommand('agent-browser get url 2>/dev/null');
-      if (urlRes?.stdout?.trim()) setUrl(urlRes.stdout.trim());
-      // Загружаем в панель
-      await loadScreenshot();
-    } catch(_) {}
-    setWorking(false);
+      await ensureViewport();
+      await snapAndLoad();
+    } finally { _busy(false); }
+  }
+
+  async function showSnapshot() {
+    _busy(true);
+    addAction('snapshot -i');
+    try {
+      const res = await execBrowser('snapshot -i');
+      const out = (res.stdout || '').slice(0, 2000);
+      const log = document.getElementById('browserActionLog');
+      if (log && out) {
+        const entry = document.createElement('div');
+        entry.className = 'browser-action-entry';
+        entry.style.whiteSpace = 'pre';
+        entry.style.fontSize = '9px';
+        entry.style.maxHeight = '160px';
+        entry.style.overflow = 'auto';
+        entry.textContent = out;
+        log.appendChild(entry);
+        log.scrollTop = log.scrollHeight;
+      }
+    } finally { _busy(false); }
+  }
+
+  // ═══ Глобальные обработчики панели ═════════════════════════════════════
+  function _wireUiOnce(root) {
+    if (!root || root._bpWired) return;
+    root._bpWired = true;
+
+    // URL submit
+    root.querySelectorAll('form[data-bp-form]').forEach(form => {
+      form.addEventListener('submit', (e) => {
+        e.preventDefault();
+        const inp = form.querySelector('[data-bp-url-input]');
+        if (inp) openUrl(inp.value);
+      });
+    });
+
+    // Action buttons
+    root.querySelectorAll('[data-bp-act]').forEach(btn => {
+      btn.addEventListener('click', async (e) => {
+        const act = btn.getAttribute('data-bp-act');
+        if (act === 'back') back();
+        else if (act === 'forward') forward();
+        else if (act === 'reload') reload();
+        else if (act === 'screenshot') refreshScreenshot();
+        else if (act === 'snapshot') showSnapshot();
+        else if (act === 'press') {
+          const key = btn.getAttribute('data-key') || 'Enter';
+          pressKey(key);
+        } else if (act === 'send-text') {
+          const inp = root.querySelector('[data-bp-text-input]');
+          if (inp && inp.value) {
+            const txt = inp.value;
+            inp.value = '';
+            await typeText(txt);
+          }
+        } else if (act === 'upload') {
+          root.querySelector('[data-bp-file-input]')?.click();
+        }
+      });
+    });
+
+    // File input change
+    root.querySelectorAll('[data-bp-file-input]').forEach(inp => {
+      inp.addEventListener('change', async (e) => {
+        const f = e.target.files && e.target.files[0];
+        e.target.value = '';
+        if (f) await uploadFile(f);
+      });
+    });
+
+    // Text input — Enter отправляет печать
+    root.querySelectorAll('[data-bp-text-input]').forEach(inp => {
+      inp.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+          e.preventDefault();
+          const txt = inp.value;
+          if (txt) {
+            inp.value = '';
+            typeText(txt).then(() => pressKey('Enter'));
+          } else {
+            pressKey('Enter');
+          }
+        }
+      });
+    });
   }
 
   // Attach listeners
@@ -13023,11 +13714,21 @@ const BrowserPanel = (() => {
     document.getElementById('browserCloseBtn')?.addEventListener('click', (e) => {
       e.stopPropagation(); closePanel();
     });
-    document.getElementById('browserRefreshBtn')?.addEventListener('click', refreshScreenshot);
-    document.getElementById('browserRefreshBtnMobile')?.addEventListener('click', refreshScreenshot);
+    _wireUiOnce(document.getElementById('browserOverlay'));
+    _wireUiOnce(document.getElementById('browserPanelMobile'));
   });
 
-  return { setUrl, setWorking, addAction, loadScreenshot, openPanel, closePanel, isOpen, refreshScreenshot };
+  // Останавливаем поллинг когда мобильная вкладка не активна
+  document.addEventListener('mobiletab:change', () => {
+    if (isOpen()) startPolling(); else stopPolling();
+  });
+
+  return {
+    setUrl, setWorking, addAction, loadScreenshot,
+    openPanel, closePanel, isOpen, refreshScreenshot,
+    openUrl, back, forward, reload, clickAt, scrollBy,
+    typeText, pressKey, uploadFile, ensureViewport,
+  };
 })();
 
 function renderBrowserWidget(command, description, result) {
