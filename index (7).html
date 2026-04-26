@@ -13115,6 +13115,10 @@ const BrowserPanel = (() => {
   let _pollHandle = null;
   let _busyDepth = 0;
   let _lastClickAt = null; // {x, y} viewport-coords последнего клика — для контекстного upload
+  // Реальные параметры viewport удалённой страницы — обновляются после каждого скриншота
+  // через `eval`. Используются для калибровки кликов (Termux-Chromium часто игнорирует
+  // setViewportSize, поэтому полагаться на наши константы нельзя).
+  let _lastVp = { w: 1280, h: 800, dpr: 1 };
 
   function isMobileLayout() {
     return window.matchMedia && window.matchMedia('(max-width: 768px)').matches;
@@ -13166,14 +13170,36 @@ const BrowserPanel = (() => {
     return await execBrowser(`eval -b ${b64}`);
   }
 
-  async function ensureViewport() {
-    if (_viewportInited) return;
-    _viewportInited = true;
+  /** Запрашивает у удалённой страницы реальные innerWidth/innerHeight/devicePixelRatio
+   *  и кэширует в _lastVp. Возвращает обновлённый объект или null если не удалось. */
+  async function _syncRemoteViewport() {
+    try {
+      const r = await evalJs('JSON.stringify({w:innerWidth,h:innerHeight,dpr:devicePixelRatio})');
+      const txt = (r && r.stdout || '').trim();
+      if (!txt) return null;
+      const obj = JSON.parse(txt);
+      if (obj && Number.isFinite(obj.w) && Number.isFinite(obj.h) && obj.w > 0 && obj.h > 0) {
+        _lastVp = { w: obj.w, h: obj.h, dpr: obj.dpr || 1 };
+        return _lastVp;
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  async function ensureViewport(force = false) {
+    if (_viewportInited && !force) return;
     const { w, h } = viewportFor(isMobileLayout() ? 'mobile' : 'desktop');
     try {
       await execBrowser(`set viewport ${w} ${h}`);
       await exec('mkdir -p ~/storage/shared/workspace/browser ~/storage/shared/workspace/browser/uploads');
-    } catch(_) {}
+      // Верификация: спросим у самой страницы, что реально применилось.
+      // Termux-Chromium часто игнорирует setViewportSize — тогда _lastVp получит
+      // фактические значения и мы будем калиброваться по ним.
+      await _syncRemoteViewport();
+      _viewportInited = true;
+    } catch(_) {
+      // Не блокируем флагом — пусть следующая попытка повторит set viewport.
+    }
   }
 
   async function loadScreenshot() {
@@ -13210,23 +13236,30 @@ const BrowserPanel = (() => {
     } catch(_) {}
   }
 
-  /** Координаты клика → viewport-координаты страницы (учитываем CSS-масштабирование img) */
+  /** Координаты клика → CSS-пиксели layout-viewport удалённой страницы.
+   *  Калибруется ПО САМОМУ скриншоту: naturalWidth/Height (device-пиксели) делим на
+   *  devicePixelRatio из _lastVp — получаем реальный CSS-viewport, в котором живёт
+   *  Playwright `page.mouse`. Так избегаем зависимости от констант 1280×800 / 414×896,
+   *  которые на Termux часто не совпадают с фактическим состоянием браузера. */
   function _eventToViewport(e, img) {
     const rect = img.getBoundingClientRect();
     if (rect.width <= 0 || rect.height <= 0) return null;
+    const dpr = (_lastVp && _lastVp.dpr) || 1;
+    // Приоритет 1: реальный размер из самого изображения (динамическая подстройка).
+    // Приоритет 2: последний известный _lastVp (если img ещё не догрузился).
+    // Приоритет 3: фоллбек на жёстко зашитый профиль (на самый крайний случай).
     const isMobile = img.closest('#browserPanelMobile') !== null;
-    const vp = viewportFor(isMobile ? 'mobile' : 'desktop');
-    // Используем naturalWidth/Height если доступны, иначе viewport — на случай retina-снимков.
-    const srcW = img.naturalWidth || vp.w;
-    const srcH = img.naturalHeight || vp.h;
-    // Скриншот всегда совпадает по соотношению с viewport, но может быть retina.
-    // Преобразуем точку клика в координаты viewport (CSS-пиксели) — туда стреляет mouse move.
-    const px = ((e.clientX - rect.left) / rect.width)  * vp.w;
-    const py = ((e.clientY - rect.top)  / rect.height) * vp.h;
+    const fallback = viewportFor(isMobile ? 'mobile' : 'desktop');
+    const natW = img.naturalWidth  > 0 ? img.naturalWidth  : 0;
+    const natH = img.naturalHeight > 0 ? img.naturalHeight : 0;
+    const vpW = natW ? (natW / dpr) : (_lastVp && _lastVp.w) || fallback.w;
+    const vpH = natH ? (natH / dpr) : (_lastVp && _lastVp.h) || fallback.h;
+    const px = ((e.clientX - rect.left) / rect.width)  * vpW;
+    const py = ((e.clientY - rect.top)  / rect.height) * vpH;
     return {
-      x: Math.max(0, Math.min(vp.w - 1, Math.round(px))),
-      y: Math.max(0, Math.min(vp.h - 1, Math.round(py))),
-      // Заодно вернём CSS-координаты внутри img — для рисования ripple
+      x: Math.max(0, Math.min(vpW - 1, Math.round(px))),
+      y: Math.max(0, Math.min(vpH - 1, Math.round(py))),
+      // CSS-координаты внутри img — для ripple-эффекта
       cssX: e.clientX - rect.left,
       cssY: e.clientY - rect.top,
     };
@@ -13245,16 +13278,51 @@ const BrowserPanel = (() => {
     const img = wrap.querySelector('img.browser-screen');
     if (!img) return;
 
-    // Click — реальный mouse down/up по координатам через agent-browser
-    img.addEventListener('click', async (e) => {
-      e.preventDefault();
-      const p = _eventToViewport(e, img);
-      if (!p) return;
-      _showRipple(wrap, p.cssX, p.cssY);
-      await clickAt(p.x, p.y);
-    });
+    const DRAG_THRESHOLD = 6;       // px — после этого считаем mousemove началом drag'а
+    const LONGPRESS_MS   = 500;     // touch: hold>500ms без движения → long-press
+    const SWIPE_MAX_DT   = 250;     // touch: жесты быстрее этого = swipe-scroll, иначе drag
 
-    // Контекст-меню: правый клик — для перенаправления в правую кнопку (опционально)
+    // ── Mouse: drag-aware. Заменяем простой click на mousedown/move/up,
+    //     чтобы отделить обычный клик от drag'а порогом DRAG_THRESHOLD.
+    let mDown = null;
+    let mDragging = false;
+    img.addEventListener('mousedown', (e) => {
+      if (e.button !== 0) return; // правую/среднюю обрабатываем через contextmenu/нет
+      e.preventDefault();
+      mDown = { x: e.clientX, y: e.clientY, time: Date.now() };
+      mDragging = false;
+    });
+    img.addEventListener('mousemove', (e) => {
+      if (!mDown) return;
+      if (!mDragging && Math.hypot(e.clientX - mDown.x, e.clientY - mDown.y) > DRAG_THRESHOLD) {
+        mDragging = true;
+      }
+    });
+    img.addEventListener('mouseup', async (e) => {
+      if (!mDown) return;
+      const start = mDown; mDown = null;
+      if (e.button !== 0) return;
+      if (mDragging) {
+        mDragging = false;
+        const ps = _eventToViewport({ clientX: start.x, clientY: start.y }, img);
+        const pe = _eventToViewport(e, img);
+        if (ps && pe) {
+          _showRipple(wrap, pe.cssX, pe.cssY);
+          await dragFromTo(ps.x, ps.y, pe.x, pe.y);
+        }
+      } else {
+        const p = _eventToViewport(e, img);
+        if (!p) return;
+        _showRipple(wrap, p.cssX, p.cssY);
+        await clickAt(p.x, p.y);
+      }
+    });
+    img.addEventListener('mouseleave', () => { mDown = null; mDragging = false; });
+    // Подавляем синтетический click после mousedown→mouseup, чтобы клики не
+    // дублировались. Используем capture-фазу.
+    img.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); }, true);
+
+    // Контекст-меню: правый клик
     img.addEventListener('contextmenu', async (e) => {
       e.preventDefault();
       const p = _eventToViewport(e, img);
@@ -13280,34 +13348,70 @@ const BrowserPanel = (() => {
       }, 80);
     }, { passive: false });
 
-    // Touch swipe — для мобильной вкладки
+    // ── Touch: tap / long-press / swipe-scroll / drag.
     let touchStart = null;
+    let lpTimer = null;
+    let lpFired = false;
     img.addEventListener('touchstart', (e) => {
       if (e.touches.length !== 1) return;
       const t = e.touches[0];
-      touchStart = { x: t.clientX, y: t.clientY, time: Date.now() };
+      touchStart = { x: t.clientX, y: t.clientY, time: Date.now(), moved: false };
+      lpFired = false;
+      clearTimeout(lpTimer);
+      lpTimer = setTimeout(async () => {
+        if (!touchStart || touchStart.moved) return;
+        lpFired = true;
+        const p = _eventToViewport({ clientX: touchStart.x, clientY: touchStart.y }, img);
+        if (p) {
+          _showRipple(wrap, p.cssX, p.cssY);
+          await holdAt(p.x, p.y, LONGPRESS_MS);
+        }
+      }, LONGPRESS_MS);
+    }, { passive: true });
+    img.addEventListener('touchmove', (e) => {
+      if (!touchStart) return;
+      const t = e.touches[0];
+      const dist = Math.hypot(t.clientX - touchStart.x, t.clientY - touchStart.y);
+      if (dist > DRAG_THRESHOLD) {
+        touchStart.moved = true;
+        clearTimeout(lpTimer);
+      }
     }, { passive: true });
     img.addEventListener('touchend', async (e) => {
+      clearTimeout(lpTimer);
       if (!touchStart) return;
+      if (lpFired) { touchStart = null; return; } // long-press уже отработал
+      const start = touchStart; touchStart = null;
       const t = e.changedTouches[0];
-      const dx = t.clientX - touchStart.x;
-      const dy = t.clientY - touchStart.y;
-      const dt = Date.now() - touchStart.time;
+      const dx = t.clientX - start.x;
+      const dy = t.clientY - start.y;
+      const dt = Date.now() - start.time;
       const dist = Math.hypot(dx, dy);
-      const synth = { clientX: touchStart.x, clientY: touchStart.y };
-      if (dist < 8 && dt < 350) {
+      if (dist < DRAG_THRESHOLD && dt < 350) {
         // Tap — клик в исходную точку
-        const p = _eventToViewport(synth, img);
+        const p = _eventToViewport({ clientX: start.x, clientY: start.y }, img);
         if (p) {
           _showRipple(wrap, p.cssX, p.cssY);
           await clickAt(p.x, p.y);
         }
-      } else if (dist >= 8) {
-        // Swipe — скролл (инвертированно: свайп вверх = скролл вниз)
-        const p = _eventToViewport(synth, img);
+      } else if (dist >= DRAG_THRESHOLD && dt < SWIPE_MAX_DT) {
+        // Быстрый свайп → скролл (инвертированно: свайп вверх = скролл вниз)
+        const p = _eventToViewport({ clientX: start.x, clientY: start.y }, img);
         if (p) await scrollBy(p.x, p.y, -dy);
+      } else if (dist >= DRAG_THRESHOLD) {
+        // Медленное движение пальца → drag
+        const ps = _eventToViewport({ clientX: start.x, clientY: start.y }, img);
+        const pe = _eventToViewport({ clientX: t.clientX, clientY: t.clientY }, img);
+        if (ps && pe) {
+          _showRipple(wrap, pe.cssX, pe.cssY);
+          await dragFromTo(ps.x, ps.y, pe.x, pe.y);
+        }
       }
+    }, { passive: true });
+    img.addEventListener('touchcancel', () => {
+      clearTimeout(lpTimer);
       touchStart = null;
+      lpFired = false;
     }, { passive: true });
   }
 
@@ -13363,14 +13467,59 @@ const BrowserPanel = (() => {
     _busy(true);
     _lastClickAt = { x, y };
     const button = opts.button || 'left';
-    addAction(`click ${x},${y}` + (button !== 'left' ? ' [' + button + ']' : ''));
+    const delay  = opts.delay  || 0;     // мс между down и up — для долгого нажатия
+    const clicks = opts.clicks || 1;     // число последовательных кликов (двойной/тройной)
+    const tag = (button !== 'left' ? ' [' + button + ']' : '')
+              + (delay  ? ` (delay ${delay}ms)` : '')
+              + (clicks > 1 ? ` x${clicks}` : '');
+    addAction(`click ${x},${y}${tag}`);
     try {
       await ensureViewport();
-      // Реальный mouse-click на координатах: move → down → up
-      await execBrowser(`mouse move ${x} ${y}`);
-      await execBrowser(`mouse down ${button}`);
-      await execBrowser(`mouse up ${button}`);
+      // Атомарный клик: один HTTP-запрос вместо трёх (move/down/up).
+      // Это убирает 50–200мс «псевдо-зажима» из-за сетевых задержек, и сайты
+      // вроде Google Maps перестают воспринимать обычный клик как long-press.
+      const flags = [`--button ${button}`];
+      if (delay)      flags.push(`--delay ${delay}`);
+      if (clicks > 1) flags.push(`--clicks ${clicks}`);
+      await execBrowser(`mouse click ${x} ${y} ${flags.join(' ')}`);
       // Небольшая задержка чтобы DOM успел отреагировать
+      await new Promise(r => setTimeout(r, 120));
+      await snapAndLoad();
+    } catch(e) {
+      addAction('error: ' + e.message);
+    } finally {
+      _busy(false);
+    }
+  }
+
+  /** Зажать и отпустить через ms миллисекунд. Используется для long-press на
+   *  мобильных и для сайтов, реагирующих на длительный mousedown. */
+  async function holdAt(x, y, ms = 600, opts = {}) {
+    _busy(true);
+    _lastClickAt = { x, y };
+    const button = opts.button || 'left';
+    addAction(`hold ${x},${y} ${ms}ms` + (button !== 'left' ? ' [' + button + ']' : ''));
+    try {
+      await ensureViewport();
+      await execBrowser(`mouse hold ${x} ${y} ${ms} --button ${button}`);
+      await new Promise(r => setTimeout(r, 120));
+      await snapAndLoad();
+    } catch(e) {
+      addAction('error: ' + e.message);
+    } finally {
+      _busy(false);
+    }
+  }
+
+  /** Drag-and-drop: down в (x1,y1) → плавно move в (x2,y2) → up. */
+  async function dragFromTo(x1, y1, x2, y2, opts = {}) {
+    _busy(true);
+    const button = opts.button || 'left';
+    const steps  = opts.steps  || 20;
+    addAction(`drag ${x1},${y1} → ${x2},${y2}`);
+    try {
+      await ensureViewport();
+      await execBrowser(`mouse drag ${x1} ${y1} ${x2} ${y2} --button ${button} --steps ${steps}`);
       await new Promise(r => setTimeout(r, 120));
       await snapAndLoad();
     } catch(e) {
@@ -13536,13 +13685,18 @@ const BrowserPanel = (() => {
     }
   }
 
-  /** Один скриншот + обновление URL + загрузка в UI */
+  /** Один скриншот + обновление URL + загрузка в UI + синхронизация _lastVp */
   async function snapAndLoad() {
     try {
       await execBrowser(`screenshot ${SCREEN_PATH}`);
       const urlRes = await execBrowser('get url 2>/dev/null');
       if (urlRes?.stdout?.trim()) setUrl(urlRes.stdout.trim());
-      await loadScreenshot();
+      // Параллельно: подтянуть картинку в UI и пересчитать реальный viewport.
+      // Любая ошибка не должна валить snapAndLoad — мы все равно покажем картинку.
+      await Promise.all([
+        loadScreenshot(),
+        _syncRemoteViewport().catch(() => null),
+      ]);
     } catch(_) {}
   }
 
@@ -13727,10 +13881,30 @@ const BrowserPanel = (() => {
     if (isOpen()) startPolling(); else stopPolling();
   });
 
+  // Пересинхронизируем viewport при смене профиля desktop↔mobile (поворот экрана,
+  // изменение размера окна). Чисто на resize без смены профиля ничего не трогаем,
+  // чтобы не дёргать удалённый Chromium лишний раз.
+  let _lastMobileLayout = null;
+  let _resizeTimer = null;
+  window.addEventListener('resize', () => {
+    clearTimeout(_resizeTimer);
+    _resizeTimer = setTimeout(() => {
+      const isMob = isMobileLayout();
+      if (_lastMobileLayout !== null && _lastMobileLayout !== isMob) {
+        _viewportInited = false;
+        if (isOpen()) {
+          ensureViewport(true).then(() => snapAndLoad()).catch(() => {});
+        }
+      }
+      _lastMobileLayout = isMob;
+    }, 250);
+  });
+  _lastMobileLayout = isMobileLayout();
+
   return {
     setUrl, setWorking, addAction, loadScreenshot,
     openPanel, closePanel, isOpen, refreshScreenshot,
-    openUrl, back, forward, reload, clickAt, scrollBy,
+    openUrl, back, forward, reload, clickAt, holdAt, dragFromTo, scrollBy,
     typeText, pressKey, uploadFile, ensureViewport,
   };
 })();

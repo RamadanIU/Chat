@@ -411,7 +411,12 @@ COMMANDS.help = async () => {
   type <selector|@ref> <text> [--delay ms]
   press [<selector|@ref>] <key>
   upload <selector|@ref> <path...>
-  mouse move|down|up|click|wheel ...
+  mouse move <x> <y> [--steps N]
+  mouse down|up [--button left|right|middle]
+  mouse click <x> <y> [--button B] [--delay ms] [--clicks N]
+  mouse hold <x> <y> <ms> [--button B]   # press, hold ms, release
+  mouse drag <x1> <y1> <x2> <y2> [--button B] [--steps N]
+  mouse wheel <dy> [<dx>]
   eval [-b] <code>
   get url|title|html|text [<selector>]
   wait <selector|@ref> [timeout-ms] | wait timeout <ms> | wait load|domcontentloaded|networkidle
@@ -550,15 +555,52 @@ COMMANDS.mouse = async (argv) => {
   const m = activePage().mouse;
   const sub = argv[0];
   if (sub === 'move') {
-    const x = parseFloat(argv[1]), y = parseFloat(argv[2]);
-    await m.move(x, y, { steps: parseInt(argv[3] || '1', 10) });
+    // mouse move <x> <y> [steps]   — backwards compat
+    // mouse move <x> <y> --steps N — flag form
+    const { flags, positional } = parseFlags(argv.slice(1));
+    const x = parseFloat(positional[0]), y = parseFloat(positional[1]);
+    const steps = parseInt(flags.steps || positional[2] || '1', 10);
+    await m.move(x, y, { steps });
   } else if (sub === 'down') {
-    await m.down({ button: argv[1] || 'left' });
+    const { flags, positional } = parseFlags(argv.slice(1));
+    await m.down({ button: flags.button || positional[0] || 'left' });
   } else if (sub === 'up') {
-    await m.up({ button: argv[1] || 'left' });
+    const { flags, positional } = parseFlags(argv.slice(1));
+    await m.up({ button: flags.button || positional[0] || 'left' });
   } else if (sub === 'click') {
-    const x = parseFloat(argv[1]), y = parseFloat(argv[2]);
-    await m.click(x, y, { button: argv[3] || 'left' });
+    // mouse click <x> <y> [button]                  — legacy
+    // mouse click <x> <y> --button left --delay N --clicks N
+    const { flags, positional } = parseFlags(argv.slice(1));
+    const x = parseFloat(positional[0]), y = parseFloat(positional[1]);
+    const opts = { button: flags.button || positional[2] || 'left' };
+    if (flags.delay)  opts.delay = parseInt(flags.delay, 10);
+    if (flags.clicks) opts.clickCount = parseInt(flags.clicks, 10);
+    await m.click(x, y, opts);
+  } else if (sub === 'hold') {
+    // mouse hold <x> <y> <ms> [button] — нажать, подержать ms, отпустить.
+    // Эквивалентно `mouse click x y --delay ms`, но более очевидно по имени
+    // и независимо от Playwright `click()` (часть сайтов реагирует только
+    // на отдельные mousedown/mouseup, а не на синтетический click).
+    const { flags, positional } = parseFlags(argv.slice(1));
+    const x = parseFloat(positional[0]), y = parseFloat(positional[1]);
+    const ms = parseInt(flags.delay || positional[2] || '500', 10);
+    const button = flags.button || positional[3] || 'left';
+    await m.move(x, y);
+    await m.down({ button });
+    await new Promise(r => setTimeout(r, ms));
+    await m.up({ button });
+  } else if (sub === 'drag') {
+    // mouse drag <x1> <y1> <x2> <y2> [--button left] [--steps N]
+    // Атомарный drag: down в (x1,y1) → плавный move в (x2,y2) → up.
+    const { flags, positional } = parseFlags(argv.slice(1));
+    const x1 = parseFloat(positional[0]), y1 = parseFloat(positional[1]);
+    const x2 = parseFloat(positional[2]), y2 = parseFloat(positional[3]);
+    const button = flags.button || 'left';
+    const steps = parseInt(flags.steps || '20', 10);
+    await m.move(x1, y1);
+    await m.down({ button });
+    await m.move(x2, y2, { steps });
+    await m.up({ button });
   } else if (sub === 'wheel') {
     const dy = parseFloat(argv[1] || '0'), dx = parseFloat(argv[2] || '0');
     await m.wheel(dx, dy);
