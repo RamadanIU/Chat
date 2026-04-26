@@ -1,23 +1,112 @@
-from flask import Flask, request, jsonify, abort
+"""Workspace API — простой HTTP-сервер для файловой системы агента.
+
+Endpoints:
+    GET  /ws/ping                          — healthcheck
+    GET  /ws/config                        — текущая рабочая область + список разрешённых корней
+    POST /ws/config   {workspace_dir}      — сменить рабочую область на лету
+    GET  /ws/list?path=&depth=             — рекурсивный обход
+    GET  /ws/info?path=                    — метаданные одного пути (file/dir/size/lines/binary)
+    GET  /ws/read?path=                    — содержимое файла (base64)
+    POST /ws/write    {path, content, ...} — запись (overwrite)
+    POST /ws/append   {path, content, ...} — дописать в конец (без read+write на клиенте)
+    POST /ws/rm       {path, recursive}    — удалить
+    POST /ws/mkdir    {path}               — создать папку
+    POST /ws/move     {src, dest}          — переместить/переименовать
+    POST /ws/copy     {src, dest, overwrite} — копировать (file/dir, рекурсивно)
+    GET  /ws/exists?path=                  — проверка существования
+    GET  /ws/search?query=&...             — поиск по содержимому файлов
+    POST /ws/reset                         — очистить рабочую область
+
+Конфигурация (env):
+    WORKSPACE_DIR       начальная рабочая область (default: ~/storage/shared/workspace,
+                        fallback ~/workspace, если первой не существует)
+    WORKSPACE_ROOTS     :-разделённый список разрешённых корней для смены пути
+                        (default: $HOME). Любой путь, в который клиент пытается
+                        переключиться через POST /ws/config, должен лежать внутри
+                        одного из этих корней.
+    WORKSPACE_HOST      адрес для прослушивания (default: 0.0.0.0)
+    WORKSPACE_PORT      порт (default: 8764)
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import os
+import re
+import shutil
+from typing import Iterable
+
+from flask import Flask, abort, jsonify, request
 from flask_cors import CORS
-import os, shutil, base64
 
 app = Flask(__name__)
 CORS(app)
 
-BASE_DIR = os.path.expanduser("~/storage/shared/workspace")
+
+# ═══════════════════════ КОНФИГУРАЦИЯ ═══════════════════════
+
+def _default_workspace() -> str:
+    """Подобрать дефолтный путь рабочей области.
+
+    Сначала пробуем Termux-путь (~/storage/shared/workspace), для обратной
+    совместимости с существующими установками. Если такого пути нет — берём
+    ~/workspace.
+    """
+    env = os.environ.get("WORKSPACE_DIR", "").strip()
+    if env:
+        return os.path.abspath(os.path.expanduser(env))
+    termux = os.path.expanduser("~/storage/shared/workspace")
+    if os.path.isdir(termux):
+        return termux
+    return os.path.expanduser("~/workspace")
+
+
+def _default_roots() -> list[str]:
+    """Список корней, в которые разрешено переключать рабочую область.
+
+    Клиент не может выйти за их пределы при смене пути — это защита от
+    `POST /ws/config {workspace_dir: "/"}` или подобных трюков.
+    """
+    env = os.environ.get("WORKSPACE_ROOTS", "").strip()
+    if env:
+        roots = [os.path.abspath(os.path.expanduser(p)) for p in env.split(":") if p.strip()]
+        return [r for r in roots if r]
+    return [os.path.expanduser("~")]
+
+
+BASE_DIR: str = _default_workspace()
+ALLOWED_ROOTS: list[str] = _default_roots()
 os.makedirs(BASE_DIR, exist_ok=True)
 
-def safe_path(rel_path):
-    abs_path = os.path.abspath(os.path.join(BASE_DIR, rel_path))
-    if not abs_path.startswith(os.path.abspath(BASE_DIR)):
-        abort(403, description="Доступ запрещён")
+
+def _is_under(path: str, parent: str) -> bool:
+    """True, если `path` лежит внутри `parent` (или равен ему)."""
+    try:
+        return os.path.commonpath([os.path.abspath(path), os.path.abspath(parent)]) == os.path.abspath(parent)
+    except ValueError:
+        # Разные диски (Windows) → точно не совпадают
+        return False
+
+
+def safe_path(rel_path: str) -> str:
+    """Преобразовать относительный путь к абсолютному и убедиться, что он внутри BASE_DIR."""
+    abs_path = os.path.abspath(os.path.join(BASE_DIR, rel_path or "."))
+    if not _is_under(abs_path, BASE_DIR):
+        abort(403, description="Доступ запрещён: путь вне рабочей области")
     return abs_path
 
-# ═══════════════ РЕКУРСИВНЫЙ ОБХОД ═══════════════
-def _walk_dir(root_abs, base_rel, max_depth, current_depth=0):
+
+# ═══════════════════════ ОБХОД И ПОИСК ═══════════════════════
+
+# Папки, которые принципиально не имеет смысла обходить рекурсивно
+# (огромные, не интересны агенту, регулярно убивают производительность).
+_SEARCH_SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".cache", "dist", "build"}
+
+
+def _walk_dir(root_abs: str, max_depth: int, current_depth: int = 0) -> list[dict]:
     """Собирает все файлы и папки внутри root_abs рекурсивно до max_depth."""
-    result = []
+    result: list[dict] = []
     if current_depth > max_depth:
         return result
     try:
@@ -27,7 +116,7 @@ def _walk_dir(root_abs, base_rel, max_depth, current_depth=0):
 
     for name in entries:
         full = os.path.join(root_abs, name)
-        rel = os.path.relpath(full, BASE_DIR).replace('\\', '/')
+        rel = os.path.relpath(full, BASE_DIR).replace("\\", "/")
         try:
             stat = os.stat(full)
         except OSError:
@@ -35,91 +124,394 @@ def _walk_dir(root_abs, base_rel, max_depth, current_depth=0):
 
         if os.path.isdir(full):
             result.append({"path": rel, "type": "dir", "bytes": 0, "mtime": stat.st_mtime})
-            # уходим вглубь, если ещё есть лимит
             if current_depth < max_depth:
-                result.extend(_walk_dir(full, rel, max_depth, current_depth + 1))
+                result.extend(_walk_dir(full, max_depth, current_depth + 1))
         else:
             result.append({"path": rel, "type": "file", "bytes": stat.st_size, "mtime": stat.st_mtime})
     return result
 
-@app.route('/ws/list')
+
+def _iter_search_files(root_abs: str) -> Iterable[str]:
+    """Обходит файлы под root_abs, пропуская тяжёлые системные папки."""
+    for dirpath, dirnames, filenames in os.walk(root_abs):
+        # in-place, чтобы os.walk не заходил внутрь
+        dirnames[:] = [d for d in dirnames if d not in _SEARCH_SKIP_DIRS]
+        for fname in filenames:
+            yield os.path.join(dirpath, fname)
+
+
+def _looks_binary(sample: bytes) -> bool:
+    if b"\x00" in sample:
+        return True
+    # доля непечатных символов
+    text_chars = bytes(range(32, 127)) + b"\n\r\t\b\f"
+    if not sample:
+        return False
+    nontext = sum(1 for b in sample if b not in text_chars)
+    return (nontext / len(sample)) > 0.30
+
+
+# ═══════════════════════ /ws/ping и /ws/config ═══════════════════════
+
+@app.route("/ws/ping")
+def ping():
+    return jsonify({"ok": True, "workspace_dir": BASE_DIR})
+
+
+@app.route("/ws/config", methods=["GET"])
+def get_config():
+    """Возвращает текущую рабочую область, свободное место и список разрешённых корней."""
+    try:
+        usage = shutil.disk_usage(BASE_DIR)
+        disk = {"total": usage.total, "used": usage.used, "free": usage.free}
+    except Exception:
+        disk = None
+    return jsonify({
+        "workspace_dir": BASE_DIR,
+        "allowed_roots": ALLOWED_ROOTS,
+        "disk": disk,
+        "exists": os.path.isdir(BASE_DIR),
+    })
+
+
+@app.route("/ws/config", methods=["POST"])
+def set_config():
+    """Сменить рабочую область на лету.
+
+    Тело: {"workspace_dir": "/абсолютный/или/~/относительный/путь"}.
+    Путь должен:
+      • быть абсолютным после раскрытия `~`,
+      • лежать внутри одного из ALLOWED_ROOTS,
+      • либо уже существовать, либо быть создаваемым (создадим mkdir -p).
+    """
+    global BASE_DIR
+    data = request.get_json(silent=True) or {}
+    new_dir = (data.get("workspace_dir") or "").strip()
+    if not new_dir:
+        abort(400, description="workspace_dir не указан")
+
+    abs_new = os.path.abspath(os.path.expanduser(new_dir))
+
+    if not any(_is_under(abs_new, root) for root in ALLOWED_ROOTS):
+        abort(403, description=(
+            f"Путь {abs_new} вне разрешённых корней: {ALLOWED_ROOTS}. "
+            "Перезапустите сервер с WORKSPACE_ROOTS=/your/root, чтобы расширить."
+        ))
+
+    try:
+        os.makedirs(abs_new, exist_ok=True)
+    except OSError as e:
+        abort(400, description=f"Не удалось создать папку: {e}")
+
+    BASE_DIR = abs_new
+    return jsonify({"ok": True, "workspace_dir": BASE_DIR})
+
+
+# ═══════════════════════ Чтение / запись / список ═══════════════════════
+
+@app.route("/ws/list")
 def list_files():
-    path = request.args.get('path', '.')
-    max_depth = int(request.args.get('depth', '10'))
+    path = request.args.get("path", ".")
+    max_depth = int(request.args.get("depth", "10"))
     abs_path = safe_path(path)
 
     if not os.path.isdir(abs_path):
         abort(404, description="Не папка")
 
-    # Теперь для ЛЮБОГО пути отдаём плоский список ВСЕХ файлов внутри до глубины max_depth
-    files = _walk_dir(abs_path, path, max_depth)
-    return jsonify({"files": files})
+    files = _walk_dir(abs_path, max_depth)
+    return jsonify({"files": files, "workspace_dir": BASE_DIR})
 
-# Остальные эндпоинты без изменений
-@app.route('/ws/ping')
-def ping():
-    return jsonify({"ok": True})
 
-@app.route('/ws/read')
+@app.route("/ws/info")
+def info():
+    """Метаданные одного пути: тип, размер, mtime, строки, бинарность."""
+    path = request.args.get("path", "")
+    if not path:
+        abort(400, description="path не указан")
+    abs_path = safe_path(path)
+    if not os.path.exists(abs_path):
+        abort(404, description="Не найден")
+
+    try:
+        stat = os.stat(abs_path)
+    except OSError as e:
+        abort(500, description=str(e))
+
+    if os.path.isdir(abs_path):
+        try:
+            children = len(os.listdir(abs_path))
+        except OSError:
+            children = 0
+        return jsonify({
+            "path": path,
+            "type": "dir",
+            "bytes": 0,
+            "mtime": stat.st_mtime,
+            "children": children,
+        })
+
+    # file: попробуем определить бинарность и посчитать строки
+    is_binary = False
+    lines = 0
+    try:
+        with open(abs_path, "rb") as f:
+            sample = f.read(8192)
+        is_binary = _looks_binary(sample)
+        if not is_binary:
+            with open(abs_path, "rb") as f:
+                # дёшево считаем переводы строк по сырым байтам
+                lines = sum(buf.count(b"\n") for buf in iter(lambda: f.read(1 << 20), b""))
+                if stat.st_size > 0:
+                    # последняя строка без \n всё равно считается
+                    lines = max(lines, 1) + (0 if sample.endswith(b"\n") else 1)
+                    # коррекция выше неточна для пустого файла; компенсируем:
+                    if lines == 0:
+                        lines = 1
+    except OSError:
+        pass
+
+    return jsonify({
+        "path": path,
+        "type": "file",
+        "bytes": stat.st_size,
+        "mtime": stat.st_mtime,
+        "lines": lines,
+        "is_binary": is_binary,
+    })
+
+
+@app.route("/ws/read")
 def read_file():
-    path = request.args['path']
+    path = request.args.get("path")
+    if not path:
+        abort(400, description="path не указан")
     abs_path = safe_path(path)
     if not os.path.isfile(abs_path):
         abort(404, description="Файл не найден")
-    with open(abs_path, 'rb') as f:
+    with open(abs_path, "rb") as f:
         content = f.read()
     return jsonify({"content": base64.b64encode(content).decode(), "encoding": "base64"})
 
-@app.route('/ws/write', methods=['POST'])
+
+def _decode_payload(data: dict) -> bytes:
+    if data.get("encoding") == "base64":
+        return base64.b64decode(data["content"])
+    return data["content"].encode("utf-8")
+
+
+@app.route("/ws/write", methods=["POST"])
 def write_file():
-    data = request.json
-    if not data or 'path' not in data or 'content' not in data:
-        abort(400)
-    path = safe_path(data['path'])
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    raw = base64.b64decode(data['content']) if data.get('encoding') == 'base64' else data['content'].encode('utf-8')
-    with open(path, 'wb') as f:
+    data = request.get_json(silent=True)
+    if not data or "path" not in data or "content" not in data:
+        abort(400, description="Нужны поля path и content")
+    path = safe_path(data["path"])
+    os.makedirs(os.path.dirname(path) or BASE_DIR, exist_ok=True)
+    raw = _decode_payload(data)
+    with open(path, "wb") as f:
         f.write(raw)
     return jsonify({"bytes": len(raw)})
 
-@app.route('/ws/rm', methods=['POST'])
+
+@app.route("/ws/append", methods=["POST"])
+def append_file():
+    """Дописать данные в конец файла без round-trip read+write."""
+    data = request.get_json(silent=True)
+    if not data or "path" not in data or "content" not in data:
+        abort(400, description="Нужны поля path и content")
+    path = safe_path(data["path"])
+    os.makedirs(os.path.dirname(path) or BASE_DIR, exist_ok=True)
+    raw = _decode_payload(data)
+    with open(path, "ab") as f:
+        f.write(raw)
+    return jsonify({"bytes": len(raw)})
+
+
+@app.route("/ws/rm", methods=["POST"])
 def rm():
-    data = request.json
-    if not data or 'path' not in data:
-        abort(400)
-    path = safe_path(data['path'])
-    recursive = data.get('recursive', True)
+    data = request.get_json(silent=True)
+    if not data or "path" not in data:
+        abort(400, description="path не указан")
+    path = safe_path(data["path"])
+    recursive = data.get("recursive", True)
+    if not os.path.exists(path):
+        abort(404, description="Не найден")
     if os.path.isdir(path):
-        shutil.rmtree(path) if recursive else os.rmdir(path)
+        if recursive:
+            shutil.rmtree(path)
+        else:
+            os.rmdir(path)
     else:
         os.remove(path)
     return jsonify({"ok": True})
 
-@app.route('/ws/mkdir', methods=['POST'])
+
+@app.route("/ws/mkdir", methods=["POST"])
 def mkdir():
-    path = safe_path(request.json['path'])
+    data = request.get_json(silent=True) or {}
+    if "path" not in data:
+        abort(400, description="path не указан")
+    path = safe_path(data["path"])
     os.makedirs(path, exist_ok=True)
     return jsonify({"ok": True})
 
-@app.route('/ws/move', methods=['POST'])
+
+@app.route("/ws/move", methods=["POST"])
 def move():
-    d = request.json
-    shutil.move(safe_path(d['src']), safe_path(d['dest']))
+    data = request.get_json(silent=True) or {}
+    if "src" not in data or "dest" not in data:
+        abort(400, description="Нужны поля src и dest")
+    src = safe_path(data["src"])
+    dest = safe_path(data["dest"])
+    if not os.path.exists(src):
+        abort(404, description="Источник не найден")
+    os.makedirs(os.path.dirname(dest) or BASE_DIR, exist_ok=True)
+    shutil.move(src, dest)
     return jsonify({"ok": True})
 
-@app.route('/ws/exists')
+
+@app.route("/ws/copy", methods=["POST"])
+def copy():
+    """Копировать файл или директорию (рекурсивно) на стороне сервера."""
+    data = request.get_json(silent=True) or {}
+    if "src" not in data or "dest" not in data:
+        abort(400, description="Нужны поля src и dest")
+    src = safe_path(data["src"])
+    dest = safe_path(data["dest"])
+    overwrite = bool(data.get("overwrite", False))
+
+    if not os.path.exists(src):
+        abort(404, description="Источник не найден")
+    if os.path.exists(dest) and not overwrite:
+        abort(409, description="Назначение уже существует, передайте overwrite=true")
+
+    os.makedirs(os.path.dirname(dest) or BASE_DIR, exist_ok=True)
+
+    if os.path.isdir(src):
+        if os.path.exists(dest) and overwrite:
+            shutil.rmtree(dest)
+        shutil.copytree(src, dest)
+        return jsonify({"ok": True, "type": "dir"})
+
+    if os.path.exists(dest) and overwrite:
+        os.remove(dest)
+    shutil.copy2(src, dest)
+    return jsonify({"ok": True, "type": "file", "bytes": os.path.getsize(dest)})
+
+
+@app.route("/ws/exists")
 def exists():
     try:
-        return jsonify({"exists": os.path.exists(safe_path(request.args.get('path', '.')))})
-    except:
+        return jsonify({"exists": os.path.exists(safe_path(request.args.get("path", ".")))})
+    except Exception:
         return jsonify({"exists": False})
 
-@app.route('/ws/reset', methods=['POST'])
+
+# ═══════════════════════ /ws/search ═══════════════════════
+
+@app.route("/ws/search")
+def search():
+    """Поиск подстроки/regex по файлам рабочей области.
+
+    Параметры:
+        query           обязательный, искомая строка/регэксп
+        path            каталог для поиска (default: ".")
+        is_regex        bool (default: false)
+        case_sensitive  bool (default: false)
+        context_lines   int (default: 2)
+        max_results     int (default: 500) — потолок, чтобы не повесить агента
+    """
+    query = request.args.get("query", "")
+    if not query:
+        abort(400, description="query не указан")
+
+    rel = request.args.get("path", ".")
+    is_regex = request.args.get("is_regex", "false").lower() == "true"
+    case_sensitive = request.args.get("case_sensitive", "false").lower() == "true"
+    context_lines = int(request.args.get("context_lines", "2"))
+    max_results = int(request.args.get("max_results", "500"))
+
+    root = safe_path(rel)
+    if not os.path.isdir(root):
+        abort(404, description="Не папка")
+
+    flags = 0 if case_sensitive else re.IGNORECASE
+    pattern = re.compile(query if is_regex else re.escape(query), flags)
+
+    results: list[dict] = []
+    truncated = False
+
+    for full in _iter_search_files(root):
+        if len(results) >= max_results:
+            truncated = True
+            break
+        try:
+            with open(full, "rb") as f:
+                head = f.read(8192)
+            if _looks_binary(head):
+                continue
+            with open(full, "r", encoding="utf-8", errors="replace") as f:
+                lines = f.read().split("\n")
+        except OSError:
+            continue
+
+        rel_path = os.path.relpath(full, BASE_DIR).replace("\\", "/")
+        for idx, line_content in enumerate(lines):
+            if pattern.search(line_content):
+                ctx_before = [
+                    {"line": i + 1, "content": lines[i]}
+                    for i in range(max(0, idx - context_lines), idx)
+                ]
+                ctx_after = [
+                    {"line": i + 1, "content": lines[i]}
+                    for i in range(idx + 1, min(len(lines), idx + context_lines + 1))
+                ]
+                results.append({
+                    "path": rel_path,
+                    "line": idx + 1,
+                    "content": line_content.strip(),
+                    "context_before": ctx_before,
+                    "context_after": ctx_after,
+                })
+                if len(results) >= max_results:
+                    truncated = True
+                    break
+
+    return jsonify({"results": results, "total": len(results), "truncated": truncated})
+
+
+# ═══════════════════════ /ws/reset ═══════════════════════
+
+@app.route("/ws/reset", methods=["POST"])
 def reset():
-    shutil.rmtree(BASE_DIR)
-    os.makedirs(BASE_DIR)
+    """Очистить (удалить и пересоздать) текущую рабочую область."""
+    if os.path.isdir(BASE_DIR):
+        shutil.rmtree(BASE_DIR)
+    os.makedirs(BASE_DIR, exist_ok=True)
     return jsonify({"ok": True})
 
-if __name__ == '__main__':
-    print("● Workspace API (рекурсивный) запущен на http://0.0.0.0:8764")
-    app.run(host='0.0.0.0', port=8764, debug=False)
+
+# ═══════════════════════ entrypoint ═══════════════════════
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Workspace API — файловый бэкенд для Agent Pro.")
+    parser.add_argument("--workspace", "-w", help="Путь к рабочей области (переопределяет $WORKSPACE_DIR).")
+    parser.add_argument("--host", default=os.environ.get("WORKSPACE_HOST", "0.0.0.0"))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("WORKSPACE_PORT", "8764")))
+    parser.add_argument("--allowed-roots", help="':'-разделённый список разрешённых корней (переопределяет $WORKSPACE_ROOTS).")
+    args = parser.parse_args()
+
+    global BASE_DIR, ALLOWED_ROOTS
+    if args.workspace:
+        BASE_DIR = os.path.abspath(os.path.expanduser(args.workspace))
+        os.makedirs(BASE_DIR, exist_ok=True)
+    if args.allowed_roots:
+        ALLOWED_ROOTS = [os.path.abspath(os.path.expanduser(p)) for p in args.allowed_roots.split(":") if p.strip()]
+
+    print(f"● Workspace API запущен на http://{args.host}:{args.port}")
+    print(f"  Рабочая область : {BASE_DIR}")
+    print(f"  Разрешённые корни: {ALLOWED_ROOTS}")
+    app.run(host=args.host, port=args.port, debug=False)
+
+
+if __name__ == "__main__":
+    main()

@@ -4814,9 +4814,32 @@ button:disabled, .icon-btn:disabled, input:disabled, textarea:disabled {
               <button id="wsApiDisableBtn" class="btn-danger">Отключить</button>
               <span id="wsApiStatus" class="status-text-small"></span>
             </div>
+
+            <!-- Папка рабочей области на сервере -->
+            <div class="setting-row" id="wsApiWorkspaceRow" style="margin-top:8px;">
+              <label>Папка рабочей области</label>
+              <input id="wsApiWorkspaceDir" type="text" class="input-modern"
+                     placeholder="/абсолютный/путь (например /home/user/project)" />
+            </div>
+            <div class="settings-actions">
+              <button id="wsApiWorkspaceApplyBtn" class="btn-primary">
+                <i data-lucide="folder-cog"></i> Применить
+              </button>
+              <span id="wsApiWorkspaceStatus" class="status-text-small"></span>
+            </div>
+            <div class="settings-hint" id="wsApiWorkspaceHint" style="opacity:.85;">
+              Здесь видно, в какой папке агент сейчас работает. Можно сменить — поле,
+              в которое перейдёт <code>list_files</code>, <code>read_file</code>,
+              <code>run_terminal</code> и все остальные файловые инструменты.<br>
+              <span style="opacity:.7;">
+                Сервер должен поддерживать <code>/ws/config</code>
+                (актуальный <code>wsapi_server.py</code>) и путь должен лежать
+                внутри одного из <code>WORKSPACE_ROOTS</code>.
+              </span>
+            </div>
+
             <div class="settings-hint">
-              Запустите <code style="color:var(--text-1);">bash setup-agent.sh</code> — API настроится автоматически.<br>
-              <span style="opacity:.7;">Workspace отражает <code style="color:var(--text-1);">/root/workspace</code> на сервере.</span>
+              Запустите <code style="color:var(--text-1);">bash setup-agent.sh</code> — API настроится автоматически.
             </div>
           </div>
 
@@ -6307,6 +6330,12 @@ const VFS = (() => {
   let _connected = false; // server mode flag
   let _serverUrl = '';
   let _serverAuth = '';
+  // Информация о сервере, известная после /ws/ping и /ws/config:
+  let _serverWorkspaceDir = '';        // абсолютный путь рабочей области на сервере
+  let _serverAllowedRoots = [];        // куда можно переключиться через setWorkspaceDir
+  // Карта поддержки эндпоинтов сервера. Пустой объект = пока не пробовали.
+  // Значение true → сервер умеет, false → отвалился (404/405) и ходить не надо.
+  const _serverFeatures = { info: null, copy: null, search: null, append: null, config: null };
 
   // ── Path normalizer ──────────────────────────────────
   function norm(p) {
@@ -6455,8 +6484,26 @@ const VFS = (() => {
     const text = await res.text();
     let data;
     try { data = JSON.parse(text); } catch { data = { error: text }; }
-    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    if (!res.ok) {
+      const err = new Error(data.error || `HTTP ${res.status}`);
+      err.status = res.status;
+      throw err;
+    }
     return data;
+  }
+
+  // Запрос к опциональному эндпоинту: помечает сервер как "не умеет" при 404/405
+  // и пробрасывает ошибку выше. Любая другая ошибка (500 и т.п.) НЕ означает
+  // отсутствия эндпоинта — фичу выключать не будем, но ошибку всё равно вернём.
+  async function _apiFetchOptional(featureKey, endpoint, method = 'GET', body = null) {
+    try {
+      const r = await _apiFetch(endpoint, method, body);
+      _serverFeatures[featureKey] = true;
+      return r;
+    } catch (e) {
+      if (e.status === 404 || e.status === 405) _serverFeatures[featureKey] = false;
+      throw e;
+    }
   }
 
   async function _srvList(dir = '.', maxDepth = 10) {
@@ -6510,10 +6557,25 @@ const VFS = (() => {
     _serverUrl = apiUrl.replace(/\/+$/, '');
     _serverAuth = auth;
     _connected = true;
+    _serverWorkspaceDir = '';
+    _serverAllowedRoots = [];
+    Object.keys(_serverFeatures).forEach(k => { _serverFeatures[k] = null; });
     try {
-      await _apiFetch('/ws/ping');
-      console.log('[VFS] Server connected →', _serverUrl);
-      return { ok: true };
+      const ping = await _apiFetch('/ws/ping');
+      // Старые серверы возвращают только {ok:true}; новые добавляют workspace_dir.
+      if (ping && typeof ping.workspace_dir === 'string') {
+        _serverWorkspaceDir = ping.workspace_dir;
+      }
+      // Опциональный /ws/config — даёт абсолютный путь и список разрешённых корней.
+      try {
+        const cfg = await _apiFetchOptional('config', '/ws/config');
+        if (cfg && typeof cfg.workspace_dir === 'string') {
+          _serverWorkspaceDir = cfg.workspace_dir;
+        }
+        if (Array.isArray(cfg?.allowed_roots)) _serverAllowedRoots = cfg.allowed_roots;
+      } catch (_) { /* старый сервер без /ws/config — это нормально */ }
+      console.log('[VFS] Server connected →', _serverUrl, _serverWorkspaceDir ? `(${_serverWorkspaceDir})` : '');
+      return { ok: true, workspace_dir: _serverWorkspaceDir };
     } catch (e) {
       _connected = false;
       return { ok: false, error: e.message };
@@ -6525,6 +6587,36 @@ const VFS = (() => {
     _backend = null;
     _serverUrl = '';
     _serverAuth = '';
+    _serverWorkspaceDir = '';
+    _serverAllowedRoots = [];
+    Object.keys(_serverFeatures).forEach(k => { _serverFeatures[k] = null; });
+  }
+
+  // ── Workspace path control ───────────────────────────
+  function getWorkspaceDir() {
+    if (_backend === 'opfs') return 'OPFS (browser)';
+    return _serverWorkspaceDir || '';
+  }
+
+  function getAllowedRoots() {
+    return _serverAllowedRoots.slice();
+  }
+
+  // Сменить рабочую область на сервере. Возвращает {ok, workspace_dir} или {ok:false, error}.
+  async function setWorkspaceDir(newPath) {
+    if (_backend !== 'server') return { ok: false, error: 'Доступно только в режиме сервера.' };
+    if (!newPath || !newPath.trim()) return { ok: false, error: 'Путь не указан.' };
+    try {
+      const r = await _apiFetchOptional('config', '/ws/config', 'POST', { workspace_dir: newPath.trim() });
+      if (r && typeof r.workspace_dir === 'string') _serverWorkspaceDir = r.workspace_dir;
+      window.dispatchEvent(new CustomEvent('vfs-workspace-changed', { detail: { workspace_dir: _serverWorkspaceDir } }));
+      return { ok: true, workspace_dir: _serverWorkspaceDir };
+    } catch (e) {
+      if (e.status === 404 || e.status === 405) {
+        return { ok: false, error: 'Сервер не поддерживает смену пути. Обновите wsapi_server.py.' };
+      }
+      return { ok: false, error: e.message };
+    }
   }
 
   function isConnected() { return _backend !== null; }
@@ -6619,6 +6711,131 @@ const VFS = (() => {
     return result;
   }
 
+  // ── Дополнительные операции (server-side, с fallback на клиентский путь) ──
+
+  // append: дописать содержимое в конец файла (UTF-8 строка или {encoding:'base64'}).
+  async function append(path, content, { encoding = 'utf8' } = {}) {
+    _requireBackend();
+    if (_backend === 'opfs') {
+      const prev = await _opfsExists(norm(path)) ? await _opfsRead(norm(path), 'text') : '';
+      return _opfsWrite(norm(path), prev + content, { encoding: 'utf8' });
+    }
+    if (_serverFeatures.append !== false) {
+      try {
+        const r = await _apiFetchOptional('append', '/ws/append', 'POST', { path: norm(path), content, encoding });
+        return r.bytes || 0;
+      } catch (e) {
+        if (e.status !== 404 && e.status !== 405) throw e;
+        // иначе fallthrough — старый сервер
+      }
+    }
+    // Fallback: read+write
+    let prev = '';
+    try { prev = await _srvRead(norm(path), 'text'); } catch {}
+    return _srvWrite(norm(path), (prev || '') + content, { encoding: 'utf8' });
+  }
+
+  // info: метаданные одного пути (size, lines, is_binary, type).
+  async function info(path) {
+    _requireBackend();
+    if (_backend === 'server' && _serverFeatures.info !== false) {
+      try {
+        return await _apiFetchOptional('info', `/ws/info?path=${encodeURIComponent(norm(path))}`);
+      } catch (e) {
+        if (e.status !== 404 && e.status !== 405) throw e;
+      }
+    }
+    // Fallback (OPFS или старый сервер): эмулируем через read/list/exists.
+    const pathExists = await exists(path);
+    if (!pathExists) throw new Error('Путь не найден: ' + path);
+    try {
+      const content = await read(path, 'text');
+      const isBinary = content === '[binary file]';
+      let lines = 0, size = 0;
+      if (!isBinary) {
+        lines = content.split('\n').length;
+        size = new Blob([content]).size;
+      } else {
+        const files = await list(path.includes('/') ? path.split('/').slice(0, -1).join('/') : '.', 1);
+        const fi = files.find(f => f.path === norm(path));
+        if (fi) size = fi.bytes || 0;
+      }
+      return { path, type: 'file', bytes: size, lines, is_binary: isBinary };
+    } catch {
+      const allFiles = await list(path, 1);
+      return { path, type: 'dir', children: allFiles.length, bytes: 0 };
+    }
+  }
+
+  // copy: скопировать файл/папку. На сервере — одной операцией; иначе — через read+write.
+  async function copy(src, dest, overwrite = false) {
+    _requireBackend();
+    if (_backend === 'server' && _serverFeatures.copy !== false) {
+      try {
+        await _apiFetchOptional('copy', '/ws/copy', 'POST', {
+          src: norm(src), dest: norm(dest), overwrite: !!overwrite,
+        });
+        return true;
+      } catch (e) {
+        if (e.status !== 404 && e.status !== 405) throw e;
+      }
+    }
+    // Fallback: только файлы (рекурсивный копир папок на клиенте слишком хрупкий).
+    const destExists = await exists(dest);
+    if (destExists && !overwrite) throw new Error(`${dest} уже существует. Используйте overwrite: true.`);
+    const raw = await getRaw(src);
+    if (!raw) throw new Error('Файл не найден: ' + src);
+    const encoding = raw.encoding || 'utf8';
+    return write(dest, raw.content, { encoding, mode: 'overwrite' });
+  }
+
+  // search: поиск по содержимому. На сервере дешевле — один HTTP-запрос вместо N.
+  async function search(query, { path = '.', is_regex = false, case_sensitive = false, context_lines = 2, max_results = 500 } = {}) {
+    _requireBackend();
+    if (_backend === 'server' && _serverFeatures.search !== false) {
+      try {
+        const qs = new URLSearchParams({
+          query, path: path || '.',
+          is_regex: String(!!is_regex),
+          case_sensitive: String(!!case_sensitive),
+          context_lines: String(context_lines),
+          max_results: String(max_results),
+        });
+        return await _apiFetchOptional('search', `/ws/search?${qs.toString()}`);
+      } catch (e) {
+        if (e.status !== 404 && e.status !== 405) throw e;
+      }
+    }
+    // Fallback — клиентский поиск (медленный для server-mode, но работает).
+    const allEntries = await list(path);
+    const files = allEntries.filter(f => f.type !== 'dir');
+    const results = [];
+    const flags = case_sensitive ? '' : 'i';
+    const regex = is_regex
+      ? new RegExp(query, flags)
+      : new RegExp(query.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&'), flags);
+    for (const file of files) {
+      if (results.length >= max_results) break;
+      try {
+        const content = await read(file.path, 'text');
+        if (content === '[binary file]') continue;
+        const lines = content.split('\n');
+        lines.forEach((lineContent, index) => {
+          if (results.length >= max_results) return;
+          if (regex.test(lineContent)) {
+            const ctxBefore = [], ctxAfter = [];
+            for (let i = Math.max(0, index - context_lines); i < index; i++)
+              ctxBefore.push({ line: i + 1, content: lines[i] });
+            for (let i = index + 1; i < Math.min(lines.length, index + context_lines + 1); i++)
+              ctxAfter.push({ line: i + 1, content: lines[i] });
+            results.push({ path: file.path, line: index + 1, content: lineContent.trim(), context_before: ctxBefore, context_after: ctxAfter });
+          }
+        });
+      } catch { /* skip unreadable */ }
+    }
+    return { results, total: results.length, truncated: results.length >= max_results };
+  }
+
   // Legacy aliases
   async function setServerMode(apiUrl, auth = '') {
     if (!apiUrl) { disconnect(); return { ok: true }; }
@@ -6627,8 +6844,9 @@ const VFS = (() => {
 
   return {
     init, norm, list, read, write, rm, mkdir, move, reset, getAllFiles,
-    exists, getRaw,
+    exists, getRaw, append, info, copy, search,
     connect, disconnect, isConnected, getUrl,
+    getWorkspaceDir, setWorkspaceDir, getAllowedRoots,
     setServerMode, isServerMode: () => _backend === 'server',
     setBackend, getType,
   };
@@ -8060,66 +8278,23 @@ const toolImpl = {
   },
 
   async copy_file({ src, dest, overwrite = false } = {}) {
-    const exists = await VFS.exists(dest);
-    if (exists && !overwrite) throw new Error(`${dest} already exists. Use overwrite: true.`);
-    // Use VFS.getRaw — works in both local and server mode
-    const raw = await VFS.getRaw(src);
-    if (!raw) throw new Error('Файл не найден: ' + src);
-    const encoding = raw.encoding || 'utf8';
-    const bytes = await VFS.write(dest, raw.content, { encoding, mode: 'overwrite' });
-    return { src, dest, bytes, ok: true };
+    // VFS.copy предпочтёт серверный /ws/copy (атомарный, поддерживает папки),
+    // если сервер не умеет — упадёт обратно на read+write на клиенте.
+    await VFS.copy(src, dest, overwrite);
+    return { src, dest, ok: true };
   },
 
-  async search_files({ query, path = '.', is_regex = false, case_sensitive = false, context_lines = 2 } = {}) {
-    const allEntries = await VFS.list(path);
-    const files = allEntries.filter(f => f.type !== 'dir');
-    const results = [];
-    // NOTE: Do NOT use 'g' flag here — .test() with 'g' updates lastIndex,
-    // causing every other match to be skipped. We test per-line, so no 'g' needed.
-    const flags = case_sensitive ? '' : 'i';
-    const searchRegex = is_regex ? new RegExp(query, flags) : new RegExp(query.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&'), flags);
-    for (const file of files) {
-      try {
-        const content = await VFS.read(file.path, 'text');
-        if (content === '[binary file]') continue;
-        const lines = content.split('\n');
-        lines.forEach((lineContent, index) => {
-          if (searchRegex.test(lineContent)) {
-            const ctxBefore = [], ctxAfter = [];
-            for (let i = Math.max(0, index - context_lines); i < index; i++)
-              ctxBefore.push({ line: i + 1, content: lines[i] });
-            for (let i = index + 1; i < Math.min(lines.length, index + context_lines + 1); i++)
-              ctxAfter.push({ line: i + 1, content: lines[i] });
-            results.push({ path: file.path, line: index + 1, content: lineContent.trim(), context_before: ctxBefore, context_after: ctxAfter });
-          }
-        });
-      } catch (e) { /* skip unreadable */ }
-    }
-    return { results, total: results.length };
+  async search_files({ query, path = '.', is_regex = false, case_sensitive = false, context_lines = 2, max_results = 500 } = {}) {
+    // VFS.search использует серверный /ws/search в режиме сервера (один запрос
+    // вместо N HTTP-чтений), и грейсфул-фолбэк на клиентский обход.
+    return await VFS.search(query, { path, is_regex, case_sensitive, context_lines, max_results });
   },
 
   async get_file_info({ path } = {}) {
-    const pathExists = await VFS.exists(path);
-    if (!pathExists) throw new Error('Путь не найден: ' + path);
-    // Try to read as file first
-    try {
-      const content = await VFS.read(path, 'text');
-      const isBinary = content === '[binary file]';
-      let lines = 0, size = 0;
-      if (!isBinary) {
-        lines = content.split('\n').length;
-        size = new Blob([content]).size;
-      } else {
-        const files = await VFS.list('.');
-        const fi = files.find(f => f.path === path);
-        if (fi) size = fi.bytes || 0;
-      }
-      return { path, size, lines, is_binary: isBinary, size_human: size < 1024 ? `${size}B` : size < 1048576 ? `${(size/1024).toFixed(1)}KB` : `${(size/1048576).toFixed(1)}MB` };
-    } catch {
-      // Probably a directory
-      const allFiles = await VFS.list(path, 1);
-      return { path, type: 'dir', children: allFiles.length, size: 0, size_human: '0B' };
-    }
+    const meta = await VFS.info(path);
+    const size = meta.bytes || 0;
+    const size_human = size < 1024 ? `${size}B` : size < 1048576 ? `${(size/1024).toFixed(1)}KB` : `${(size/1048576).toFixed(1)}MB`;
+    return { ...meta, size, size_human };
   },
 
   async update_plan({ steps } = {}) {
@@ -8251,9 +8426,14 @@ const toolImpl = {
     const host = localStorage.getItem('agent_term_host') || '';
     if (!host) return { error: 'Терминал-сервер не настроен. Укажите URL в настройках → Терминал.', exit_code: 1 };
 
-    // wsapi_server.py exposes ~/storage/shared/workspace as workspace root,
-    // so screenshots / uploads must live there to be visible to the chat VFS.
-    const SCREEN_PATH = '~/storage/shared/workspace/browser/screen.png';
+    // Скриншоты/аплоады должны лежать ВНУТРИ той же папки, что обслуживает
+    // wsapi_server.py — иначе VFS их не увидит. Берём путь из настроек, чтобы
+    // не зависеть от хардкода ~/storage/shared/workspace.
+    const wsRoot = (typeof VFS !== 'undefined' && VFS.isServerMode())
+      ? (VFS.getWorkspaceDir() || '~/workspace')
+      : '~/workspace';
+    const shellWsRoot = wsRoot.replace(/(["\\$`])/g, '\\$1');
+    const SCREEN_PATH = `${shellWsRoot}/browser/screen.png`;
 
     // UI: показываем что браузер работает
     BrowserPanel.setWorking(true, description || command);
@@ -8261,7 +8441,7 @@ const toolImpl = {
 
     try {
       // 1. Создаём папку если нет (один раз, тихо)
-      await TermEngine.execAgentCommand('mkdir -p ~/storage/shared/workspace/browser');
+      await TermEngine.execAgentCommand(`mkdir -p "${shellWsRoot}/browser"`);
 
       // 2. Выполняем саму команду агента
       const fullCmd = `agent-browser ${command.trim()}`;
@@ -11016,7 +11196,7 @@ Execution:
   4. click @eK on the submit button.
   5. screenshot or get text/url to verify.
   Key commands: open, back, forward, reload, snapshot -i, click, fill, type, press, upload, screenshot, eval, wait, get url|title|text|html, set viewport, tabs new|list|switch|close, cookies, hover, mouse move|click|wheel.
-  ALWAYS use "open <url>" first, then "snapshot -i" to discover interactive elements. Use refs (@e1, @e2...) from snapshot — they're more reliable than CSS selectors. For uploads, write the file to a known path first via run_terminal (e.g. ~/storage/shared/workspace/browser/uploads/diplom.pdf), then upload @eN ~/storage/shared/workspace/browser/uploads/diplom.pdf.
+  ALWAYS use "open <url>" first, then "snapshot -i" to discover interactive elements. Use refs (@e1, @e2...) from snapshot — they're more reliable than CSS selectors. For uploads, write the file to a known path first via run_terminal under <WORKSPACE>/browser/uploads/<filename> (the WORKSPACE INFO block below tells you the exact path), then upload @eN <full-path>.
 - run_project(build?, serve, port, url?) — FULL BUILD PIPELINE. Runs build command via terminal, starts the serve command in background, waits for the server to be ready, then opens a live preview iframe. The server hostname is auto-detected from terminal server settings.
   Examples:
   • React/Vite prod:  build="npm install && npm run build", serve="npx serve dist -l {port}", port=3000
@@ -11048,6 +11228,28 @@ TIPS:
 function getSystemPrompt() {
   const custom = localStorage.getItem('agent_custom_system_prompt');
   return (custom !== null && custom !== '') ? custom : DEFAULT_SYSTEM_PROMPT;
+}
+
+// Готовит блок «WORKSPACE INFO», который добавляется к system prompt'у
+// перед каждым обращением к модели. Так агент знает точный абсолютный путь
+// своей рабочей области и не пытается угадать его.
+function getWorkspaceContextBlock() {
+  if (typeof VFS === 'undefined') return '';
+  const wd = (() => { try { return VFS.getWorkspaceDir(); } catch { return ''; } })();
+  const isServer = (() => { try { return VFS.isServerMode(); } catch { return false; } })();
+  if (!wd) {
+    return '\n\n--- WORKSPACE INFO ---\nNo workspace is currently connected. The user must connect Workspace API or activate OPFS in settings before file tools can be used.\n--- END WORKSPACE INFO ---';
+  }
+  if (!isServer) {
+    return `\n\n--- WORKSPACE INFO ---\nWorkspace backend: in-browser OPFS (no server filesystem). All file paths in tool calls are relative to this virtual root. run_terminal targets the remote server and is independent of OPFS.\n--- END WORKSPACE INFO ---`;
+  }
+  return `\n\n--- WORKSPACE INFO ---
+Your workspace root on the remote server is exactly:
+  ${wd}
+All paths passed to list_files / read_file / write_file / str_replace / edit_lines / search_files / get_file_info / mkdir_p / rm_path / move_path / copy_file are RELATIVE to this root. Never include the absolute prefix in those paths — pass "src/main.py", not "${wd}/src/main.py".
+For run_terminal the working directory is also this folder by default; use absolute paths or "cd ${wd} && ..." only if you genuinely need to escape it.
+The user can change this path at runtime via Settings → Workspace → "Папка рабочей области". If a tool reports the path is missing, do NOT try to recreate the workspace — tell the user that the configured path no longer exists.
+--- END WORKSPACE INFO ---`;
 }
 
 function loadActiveChat() {
@@ -11122,7 +11324,7 @@ async function runSubAgent(task, context = '', stepTitle = 'Sub-task', uiElement
   
   // Build isolated message history — NO main conversation memory
   const subMessages = [
-    { role: 'system', content: SUB_AGENT_SYSTEM_PROMPT },
+    { role: 'system', content: SUB_AGENT_SYSTEM_PROMPT + getWorkspaceContextBlock() },
     { role: 'user', content: `TASK: ${task}${context ? '\n\nCONTEXT:\n' + context : ''}` }
   ];
 
@@ -11706,7 +11908,8 @@ async function runAgent(userText) {
   const chat = ChatManager.getActive();
   if (!chat) return;
   const skillsAddition = (typeof SkillsEngine !== 'undefined') ? SkillsEngine.getSkillsListPrompt() : '';
-  const effectiveSystemPrompt = getSystemPrompt() + skillsAddition;
+  const workspaceCtx = getWorkspaceContextBlock();
+  const effectiveSystemPrompt = getSystemPrompt() + skillsAddition + workspaceCtx;
   if (chat.messages.length === 0 || chat.messages[0].role !== 'system') {
     chat.messages.unshift({ role: 'system', content: effectiveSystemPrompt });
   } else if (chat.messages[0].role === 'system') {
@@ -12400,6 +12603,8 @@ async function _uploadFileToWorkspace(file, content, encoding) {
   }
   // Init workspace backend UI
   if (typeof WsBackend !== 'undefined') WsBackend.init();
+  // Sync workspace badges/inputs with the actual VFS state (path, etc.)
+  if (typeof syncWorkspaceUI === 'function') syncWorkspaceUI();
   await refreshFilesPanel();
   renderChatTabs();
   loadActiveChat();
@@ -13212,10 +13417,23 @@ function renderTerminalWidget(command, result) {
 
 /* ========= BROWSER PANEL ENGINE (Interactive) ========= */
 const BrowserPanel = (() => {
-  // wsapi_server.py serves ~/storage/shared/workspace as workspace root,
-  // so the screenshot / upload paths live there (not in ~/workspace).
-  const SCREEN_PATH = '~/storage/shared/workspace/browser/screen.png';
-  const UPLOADS_DIR = '~/storage/shared/workspace/browser/uploads';
+  // Скриншот и аплоады кладём ВНУТРЬ корня wsapi_server.py — иначе VFS их не
+  // увидит. Берём актуальный путь из VFS, а не хардкод ~/storage/shared/...
+  function _wsRoot() {
+    try {
+      if (typeof VFS !== 'undefined' && VFS.isServerMode()) {
+        return VFS.getWorkspaceDir() || '~/workspace';
+      }
+    } catch (_) {}
+    return '~/workspace';
+  }
+  function _shellQuote(p) { return p.replace(/(["\\$`])/g, '\\$1'); }
+  function _screenPath() { return `${_shellQuote(_wsRoot())}/browser/screen.png`; }
+  function _uploadsDir() { return `${_shellQuote(_wsRoot())}/browser/uploads`; }
+  // Сохраняем имена-константы для совместимости с остальным модулем —
+  // теперь это геттеры, а не строки.
+  const SCREEN_PATH_GETTER = _screenPath;
+  const UPLOADS_DIR_GETTER = _uploadsDir;
   // Default desktop viewport — большой и удобный для работы с сайтами.
   // Для мобильной вкладки используем телефонный профиль.
   const DESKTOP_VIEWPORT = { w: 1280, h: 800 };
@@ -13306,7 +13524,8 @@ const BrowserPanel = (() => {
     const { w, h } = viewportFor(isMobileLayout() ? 'mobile' : 'desktop');
     try {
       await execBrowser(`set viewport ${w} ${h}`);
-      await exec('mkdir -p ~/storage/shared/workspace/browser ~/storage/shared/workspace/browser/uploads');
+      const wsRoot = _shellQuote(_wsRoot());
+      await exec(`mkdir -p "${wsRoot}/browser" "${wsRoot}/browser/uploads"`);
       // Верификация: спросим у самой страницы, что реально применилось.
       // Termux-Chromium часто игнорирует setViewportSize — тогда _lastVp получит
       // фактические значения и мы будем калиброваться по ним.
@@ -13737,7 +13956,7 @@ const BrowserPanel = (() => {
       const safeName = file.name.replace(/[^A-Za-z0-9._-]+/g, '_');
       const vfsPath = 'browser/uploads/' + safeName;
       await VFS.write(vfsPath, b64, { encoding: 'base64', mode: 'overwrite' });
-      const remotePath = `${UPLOADS_DIR}/${safeName}`;
+      const remotePath = `${UPLOADS_DIR_GETTER()}/${safeName}`;
 
       // 2) Найти ref ближайшего file-input. Сначала пробуем активный элемент,
       //    затем — самый близкий к последнему клику.
@@ -13803,7 +14022,7 @@ const BrowserPanel = (() => {
   /** Один скриншот + обновление URL + загрузка в UI + синхронизация _lastVp */
   async function snapAndLoad() {
     try {
-      await execBrowser(`screenshot ${SCREEN_PATH}`);
+      await execBrowser(`screenshot ${SCREEN_PATH_GETTER()}`);
       const urlRes = await execBrowser('get url 2>/dev/null');
       if (urlRes?.stdout?.trim()) setUrl(urlRes.stdout.trim());
       // Параллельно: подтянуть картинку в UI и пересчитать реальный viewport.
@@ -14533,6 +14752,7 @@ document.getElementById('wsApiTestBtn')?.addEventListener('click', async () => {
   if (result && result.ok) {
     statusEl.textContent = '✓ Подключено'; statusEl.style.color = 'var(--success)';
     await refreshFilesPanel();
+    syncWorkspaceUI();
     setStatus('Workspace · Сервер (' + url + ')', 'ok');
   } else {
     statusEl.textContent = '✗ ' + (result ? result.error : 'Ошибка'); statusEl.style.color = 'var(--error)';
@@ -14550,8 +14770,59 @@ document.getElementById('wsApiDisableBtn')?.addEventListener('click', async () =
   const chip = document.getElementById('wsActiveChip');
   if (chip) chip.style.display = 'none';
   await refreshFilesPanel();
+  syncWorkspaceUI();
   setStatus('Workspace отключён', 'ok');
 });
+
+// Применить новый путь рабочей области (POST /ws/config).
+document.getElementById('wsApiWorkspaceApplyBtn')?.addEventListener('click', async () => {
+  const newPath = (document.getElementById('wsApiWorkspaceDir').value || '').trim();
+  const statusEl = document.getElementById('wsApiWorkspaceStatus');
+  if (!newPath) { statusEl.textContent = '⚠ Укажите путь'; statusEl.style.color = 'var(--warning)'; return; }
+  if (!VFS.isServerMode()) { statusEl.textContent = '⚠ Доступно только в режиме сервера'; statusEl.style.color = 'var(--warning)'; return; }
+  statusEl.textContent = '⏳ Применяю...'; statusEl.style.color = 'var(--text-2)';
+  const r = await VFS.setWorkspaceDir(newPath);
+  if (r.ok) {
+    statusEl.textContent = '✓ ' + r.workspace_dir; statusEl.style.color = 'var(--success)';
+    await refreshFilesPanel();
+    syncWorkspaceUI();
+    setStatus('Workspace · ' + r.workspace_dir, 'ok');
+  } else {
+    statusEl.textContent = '✗ ' + r.error; statusEl.style.color = 'var(--error)';
+  }
+});
+
+// Синхронизирует UI с текущей рабочей областью VFS:
+// • поле ввода workspace dir получает актуальное значение,
+// • бейджи терминала (~/workspace) показывают реальный путь,
+// • чип в шапке тоже.
+function syncWorkspaceUI() {
+  const wd = (typeof VFS !== 'undefined') ? VFS.getWorkspaceDir() : '';
+  const display = wd || '~/workspace';
+  const dirInput = document.getElementById('wsApiWorkspaceDir');
+  if (dirInput && document.activeElement !== dirInput) dirInput.value = wd || '';
+  const allowed = (typeof VFS !== 'undefined') ? VFS.getAllowedRoots() : [];
+  const hint = document.getElementById('wsApiWorkspaceHint');
+  if (hint && allowed.length) {
+    const rootsHtml = allowed.map(r => `<code>${r}</code>`).join(', ');
+    hint.innerHTML = `Здесь видно, в какой папке агент сейчас работает. Можно сменить — поле,
+      в которое перейдёт <code>list_files</code>, <code>read_file</code>,
+      <code>run_terminal</code> и все остальные файловые инструменты.<br>
+      <span style="opacity:.7;">Разрешённые корни сервера: ${rootsHtml}.</span>`;
+  }
+  const ids = ['termCwdBadge', 'termCwdBadgeMobile'];
+  ids.forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = display;
+  });
+  const chip = document.getElementById('wsActiveChip');
+  if (chip && wd && VFS.isServerMode()) {
+    chip.title = wd;
+  }
+}
+window.syncWorkspaceUI = syncWorkspaceUI;
+window.addEventListener('vfs-backend-changed', () => { try { syncWorkspaceUI(); } catch {} });
+window.addEventListener('vfs-workspace-changed', () => { try { syncWorkspaceUI(); } catch {} });
 
 // ── OPFS handlers ──────────────────────────────────────
 document.getElementById('opfsActivateBtn')?.addEventListener('click', async () => {
