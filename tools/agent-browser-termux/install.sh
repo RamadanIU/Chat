@@ -117,6 +117,13 @@ if [ ! -d "${PT_ROOT}/node_modules/playwright-core" ]; then
   ( cd "${PT_ROOT}" && npm install --no-audit --no-fund --silent playwright-core dotenv )
 fi
 
+# ── Stop any running daemon so updated code takes effect ────────────────────
+if command -v agent-browser >/dev/null 2>&1; then
+  info "Stopping any running daemon (so new code takes effect)..."
+  agent-browser kill >/dev/null 2>&1 || true
+  sleep 0.5
+fi
+
 # ── Drop daemon.js / cli.js ─────────────────────────────────────────────────
 mkdir -p "${SHIM_DIR}"
 

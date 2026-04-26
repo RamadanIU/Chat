@@ -100,26 +100,57 @@ function ensureBrowser() {
 }
 async function _ensureBrowserInner() {
   if (browser && browser.isConnected && browser.isConnected() && pages.length) return;
+
+  // Match exactly the args the user's tested ~/playwright-termux skill uses.
+  // Anything beyond these three has historically broken Termux Chromium
+  // (e.g. --no-zygote, --disable-features=site-per-process).
+  // Extra args can be added via AGENT_BROWSER_EXTRA_ARGS env var (space-separated).
+  const baseArgs = ['--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage'];
+  const extra = (process.env.AGENT_BROWSER_EXTRA_ARGS || '').trim().split(/\s+/).filter(Boolean);
   const launchOpts = {
     headless: HEADLESS,
-    args: [
-      '--no-sandbox',
-      '--disable-gpu',
-      '--disable-dev-shm-usage',
-      '--disable-setuid-sandbox',
-      '--no-zygote',
-      '--disable-features=site-per-process',
-    ],
+    args: [...baseArgs, ...extra],
   };
   if (CHROMIUM_PATH) launchOpts.executablePath = CHROMIUM_PATH;
   log('launching chromium', JSON.stringify(launchOpts));
-  browser = await chromium.launch(launchOpts);
 
-  const ctxOpts = { viewport, ignoreHTTPSErrors: true, userAgent: undefined };
-  if (fs.existsSync(STORAGE_STATE_FILE)) {
-    try { ctxOpts.storageState = STORAGE_STATE_FILE; } catch (_) {}
+  try {
+    browser = await chromium.launch(launchOpts);
+  } catch (e) {
+    log('chromium.launch failed', e && (e.stack || e.message || e));
+    throw new Error('chromium.launch failed: ' + (e && e.message ? e.message : String(e))
+      + '\nCHROMIUM_PATH=' + (CHROMIUM_PATH || '(unset)')
+      + '\nExecutable check: ' + (CHROMIUM_PATH ? (fs.existsSync(CHROMIUM_PATH) ? 'exists' : 'MISSING') : 'n/a')
+      + '\nSee daemon log: ' + LOG_FILE);
   }
-  context = await browser.newContext(ctxOpts);
+
+  // Browser may die before we get to newContext on broken environments —
+  // surface that with a clearer message than Playwright's "Target ... has been closed".
+  browser.on('disconnected', () => { log('browser disconnected'); });
+
+  const ctxOpts = { viewport, ignoreHTTPSErrors: true };
+  if (fs.existsSync(STORAGE_STATE_FILE)) {
+    try {
+      const raw = fs.readFileSync(STORAGE_STATE_FILE, 'utf8');
+      JSON.parse(raw); // validate
+      ctxOpts.storageState = STORAGE_STATE_FILE;
+    } catch (e) {
+      log('storage-state file corrupt, ignoring:', e.message);
+      try { fs.unlinkSync(STORAGE_STATE_FILE); } catch (_) {}
+    }
+  }
+
+  try {
+    context = await browser.newContext(ctxOpts);
+  } catch (e) {
+    log('newContext failed', e && (e.stack || e.message || e));
+    try { await browser.close(); } catch (_) {}
+    browser = null;
+    throw new Error('newContext failed: ' + (e && e.message ? e.message : String(e))
+      + '\nThis usually means Chromium crashed right after launching.'
+      + '\nTry running ~/playwright-termux/test-launch.js manually to see if your base setup works.'
+      + '\nSee daemon log: ' + LOG_FILE);
+  }
   context.setDefaultTimeout(DEFAULT_TIMEOUT);
   context.setDefaultNavigationTimeout(DEFAULT_TIMEOUT);
 
@@ -135,9 +166,15 @@ async function _ensureBrowserInner() {
     });
   });
 
-  const p0 = await context.newPage();
-  pages = [p0];
-  activeIndex = 0;
+  try {
+    const p0 = await context.newPage();
+    pages = [p0];
+    activeIndex = 0;
+  } catch (e) {
+    log('newPage failed', e && (e.stack || e.message || e));
+    throw new Error('newPage failed: ' + (e && e.message ? e.message : String(e))
+      + '\nChromium probably crashed mid-launch. Check daemon log: ' + LOG_FILE);
+  }
 }
 
 function activePage() {
