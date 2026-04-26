@@ -71,8 +71,19 @@
 
   --font-sans: 'SF Pro Display', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   --font-mono: 'SF Mono', 'Fira Code', ui-monospace, Menlo, Consolas, monospace;
-  --transition: 0.15s ease;
-  --transition-slow: 0.25s ease;
+
+  /* Easings */
+  --ease-out-expo:  cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-out-quart: cubic-bezier(0.25, 1, 0.5, 1);
+  --ease-in-out:    cubic-bezier(0.65, 0, 0.35, 1);
+  --ease-spring:    cubic-bezier(0.34, 1.56, 0.64, 1);
+  --ease-soft:      cubic-bezier(0.4, 0, 0.2, 1);
+
+  /* Smooth, natural transitions */
+  --transition:        0.22s var(--ease-out-quart);
+  --transition-slow:   0.4s  var(--ease-out-expo);
+  --transition-fast:   0.14s var(--ease-soft);
+  --transition-spring: 0.45s var(--ease-spring);
 }
 
 [data-theme="light"] {
@@ -3629,6 +3640,287 @@ select.input-modern { background-image: url("data:image/svg+xml,%3Csvg xmlns='ht
   font-size: 10px;
   color: var(--text-2);
   font-family: var(--font-mono);
+}
+
+/* ============================================================
+   ===== ENHANCED ANIMATIONS — SMOOTH & POLISHED VISUALS =====
+   ============================================================ */
+
+/* Universal smooth transitions on common interactive elements.
+   Targeted (not "* { transition: all }") to avoid layout-thrash
+   while still covering everything not explicitly transitioned. */
+button, a, input, textarea, select,
+.icon-btn, .term-toggle-btn, .theme-toggle,
+.tab, .tab-btn, .file-item, .folder-item,
+.skill-item, .msg, .plan-chat-item, .plan-item,
+.attachment-chip, .model-option, .model-select-btn,
+.send-btn, .composer-btn, .stop-btn,
+.welcome-action, .browser-action, .modal-btn,
+.settings-row, .settings-input, .settings-toggle,
+.dropdown-item, .ctx-menu-item, .quick-action,
+.token-pill, .plan-badge-mini, .badge,
+.modal, .modal-content, .runner-overlay, .terminal-overlay,
+.popover, .menu, .toast {
+  transition:
+    background-color var(--transition),
+    border-color     var(--transition),
+    color            var(--transition),
+    box-shadow       var(--transition),
+    transform        var(--transition),
+    opacity          var(--transition),
+    filter           var(--transition);
+}
+
+/* Smooth theme transition without affecting layout */
+html { transition: background-color var(--transition-slow); }
+
+/* SVG icon micro-animations */
+button svg, .icon-btn svg, a svg, .tab svg,
+.tab-btn svg, .file-item svg, .folder-item svg,
+.skill-item svg, .send-btn svg, .composer-btn svg {
+  transition: transform var(--transition), color var(--transition), opacity var(--transition);
+}
+.icon-btn:hover svg,
+.composer-btn:hover svg { transform: scale(1.08); }
+.icon-btn:active svg,
+.composer-btn:active svg { transform: scale(0.92); transition-duration: 0.08s; }
+
+/* Subtle press feedback on any clickable element */
+button:active, .icon-btn:active, .term-toggle-btn:active,
+.theme-toggle:active, .tab:active, .tab-btn:active,
+.file-item:active, .folder-item:active, .skill-item:active,
+.send-btn:active, .composer-btn:active,
+.welcome-action:active, .modal-btn:active {
+  transform: scale(0.97);
+  transition-duration: 0.08s;
+}
+
+/* Icon buttons gain a soft glow on hover */
+.icon-btn:hover,
+.term-toggle-btn:hover,
+.theme-toggle:hover {
+  box-shadow: 0 2px 12px -2px var(--shadow), 0 0 0 1px var(--border-focus) inset;
+}
+
+/* Send button — premium animated feel */
+.send-btn,
+.composer-btn.send,
+button.send-btn {
+  transition:
+    background-color var(--transition),
+    color            var(--transition),
+    transform        var(--transition-spring),
+    box-shadow       var(--transition);
+}
+.send-btn:hover,
+.composer-btn.send:hover,
+button.send-btn:hover {
+  transform: translateY(-1px) scale(1.03);
+  box-shadow: 0 6px 20px -6px var(--shadow-lg);
+}
+.send-btn:active,
+.composer-btn.send:active,
+button.send-btn:active {
+  transform: translateY(0) scale(0.96);
+  transition-duration: 0.08s;
+}
+
+/* File / folder rows — subtle slide on hover */
+.file-item, .folder-item {
+  will-change: transform;
+}
+.file-item:hover,
+.folder-item:hover {
+  transform: translateX(2px);
+}
+
+/* Skill / plan items — soft lift on hover */
+.skill-item:hover,
+.plan-chat-item:hover,
+.plan-item:hover {
+  transform: translateY(-1px);
+}
+
+/* Tabs — smoother selection */
+.tab, .tab-btn {
+  position: relative;
+}
+.tab:hover, .tab-btn:hover { color: var(--text-0); }
+
+/* Inputs / textarea — smooth focus ring */
+input, textarea, select,
+.settings-input, .chat-input, .composer-input {
+  transition:
+    border-color var(--transition),
+    box-shadow   var(--transition),
+    background-color var(--transition);
+}
+input:focus, textarea:focus, select:focus,
+.settings-input:focus, .chat-input:focus, .composer-input:focus {
+  box-shadow: 0 0 0 3px var(--accent-dim);
+}
+
+/* Modals / overlays — graceful entrance */
+@keyframes overlayFadeIn {
+  from { opacity: 0; backdrop-filter: blur(0px); }
+  to   { opacity: 1; backdrop-filter: blur(8px); }
+}
+@keyframes modalScaleIn {
+  from { opacity: 0; transform: translate(-50%, -50%) scale(0.94); filter: blur(4px); }
+  to   { opacity: 1; transform: translate(-50%, -50%) scale(1);    filter: blur(0); }
+}
+@keyframes modalScaleInCentered {
+  from { opacity: 0; transform: scale(0.94) translateY(8px); filter: blur(4px); }
+  to   { opacity: 1; transform: scale(1)    translateY(0);   filter: blur(0); }
+}
+
+.modal,
+.runner-overlay,
+.terminal-overlay,
+.browser-overlay,
+.skills-modal-backdrop,
+.plan-popover-backdrop {
+  animation: overlayFadeIn 0.28s var(--ease-out-quart) both;
+}
+.modal-content,
+.runner-overlay-content,
+.terminal-overlay-content,
+.skills-modal,
+.plan-popover {
+  animation: modalScaleInCentered 0.32s var(--ease-out-expo) both;
+}
+
+/* Smooth panel/column transitions */
+.panel, .panel-files, .panel-chat, .panel-plan, .panel-browser {
+  transition: width var(--transition-slow), opacity var(--transition-slow), transform var(--transition-slow);
+}
+
+/* Mobile tabs — bouncy active indicator */
+.mobile-tab, .mobile-tab-btn {
+  transition:
+    color            var(--transition),
+    background-color var(--transition),
+    transform        var(--transition-spring);
+}
+.mobile-tab.active, .mobile-tab-btn.active {
+  transform: translateY(-1px);
+}
+
+/* Toast / popover entrance */
+@keyframes toastSlideIn {
+  from { opacity: 0; transform: translateY(12px) scale(0.96); }
+  to   { opacity: 1; transform: translateY(0)    scale(1); }
+}
+.toast, .menu.appearing, .popover.appearing {
+  animation: toastSlideIn 0.32s var(--ease-out-expo) both;
+}
+
+/* Smooth chat scroll on programmatic jumps */
+.chat-log, #chatLog, .messages, .message-list {
+  scroll-behavior: smooth;
+}
+
+/* Welcome screen — refined entrance & breathing logo */
+@keyframes welcomeMainRise {
+  from { opacity: 0; transform: translateY(18px) scale(0.985); filter: blur(6px); letter-spacing: 0.08em; }
+  to   { opacity: 1; transform: translateY(0)    scale(1);     filter: blur(0);   letter-spacing: 0.04em; }
+}
+@keyframes welcomeSubRise {
+  from { opacity: 0; transform: translateY(10px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes welcomeLogoBreath {
+  0%, 100% { text-shadow: 0 0 20px var(--welcome-glow-near), 0 0 60px var(--welcome-glow-far); }
+  50%      { text-shadow: 0 0 28px var(--welcome-glow-near), 0 0 90px var(--welcome-glow-far); }
+}
+#welcomeMain {
+  animation:
+    welcomeMainRise   0.9s var(--ease-out-expo) both,
+    welcomeLogoBreath 4.5s ease-in-out 0.9s infinite;
+}
+#welcomeSub {
+  animation: welcomeSubRise 0.9s var(--ease-out-expo) 0.15s both;
+}
+
+/* Typing dots / status pulse — smoother loop */
+@keyframes statusGlow {
+  0%, 100% { box-shadow: 0 0 4px var(--warning); }
+  50%      { box-shadow: 0 0 12px var(--warning); }
+}
+.status-dot.working {
+  animation: dotPulse 1.4s ease-in-out infinite, statusGlow 2.4s ease-in-out infinite;
+}
+
+/* Code block / table row hover */
+table tr {
+  transition: background-color var(--transition);
+}
+
+/* Settings rows */
+.settings-row, .accordion-row {
+  transition:
+    background-color var(--transition),
+    border-color     var(--transition),
+    transform        var(--transition);
+}
+.settings-row:hover { transform: translateX(1px); }
+
+/* Chevrons / disclosure arrows everywhere — silky rotation */
+.chevron, .arrow, .disclosure,
+[class*="-arrow"], [class*="-chevron"] {
+  transition: transform 0.3s var(--ease-out-expo);
+}
+
+/* Ripple-like accent on primary actions */
+@keyframes softPulse {
+  0%   { box-shadow: 0 0 0 0 var(--accent-dim); }
+  70%  { box-shadow: 0 0 0 8px transparent; }
+  100% { box-shadow: 0 0 0 0 transparent; }
+}
+.send-btn:focus-visible,
+.composer-btn.send:focus-visible {
+  animation: softPulse 0.6s var(--ease-out-expo);
+}
+
+/* New message in chat — gentle stagger via slide+fade.
+   We don't override the existing .msg animation (msgSlideIn);
+   this keyframe is exposed for any new elements that want it. */
+@keyframes msgPolishedIn {
+  from { opacity: 0; transform: translateY(10px) scale(0.99); filter: blur(2px); }
+  to   { opacity: 1; transform: translateY(0)    scale(1);    filter: blur(0); }
+}
+
+/* Avatar / icon pulse for thinking states */
+@keyframes avatarBreath {
+  0%, 100% { transform: scale(1);    opacity: 0.85; }
+  50%      { transform: scale(1.06); opacity: 1; }
+}
+.msg.thinking .thinking-icon,
+.sub-agent-icon.working {
+  animation: avatarBreath 1.8s ease-in-out infinite, thinkPulse 2s ease-in-out infinite;
+}
+
+/* Smooth open/close for any [hidden]/.hidden toggles */
+.fade-enter { animation: msgPolishedIn 0.3s var(--ease-out-expo) both; }
+.fade-leave { animation: msgPolishedIn 0.25s var(--ease-out-quart) reverse both; }
+
+/* Disabled states — graceful */
+button:disabled, .icon-btn:disabled, input:disabled, textarea:disabled {
+  transition:
+    opacity        var(--transition),
+    filter         var(--transition),
+    background-color var(--transition);
+  filter: saturate(0.6);
+}
+
+/* Honor reduced-motion preference globally */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
 }
 </style>
 </head>
