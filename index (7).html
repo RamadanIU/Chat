@@ -4665,6 +4665,30 @@ button:disabled, .icon-btn:disabled, input:disabled, textarea:disabled {
         </div>
       </div><!-- /settings-card Система -->
 
+      <!-- ══ ИНСТРУМЕНТЫ (Tools) ══ -->
+      <div class="settings-card">
+        <button class="settings-card-header" onclick="toggleSettingsCard(this)">
+          <i data-lucide="wrench" class="settings-card-header-icon"></i>
+          <span class="settings-card-header-label">Инструменты</span>
+          <span id="toolsHeaderBadge" style="margin-left:auto;margin-right:8px;font-size:10px;color:var(--text-2);font-weight:500;"></span>
+          <i data-lucide="chevron-down" class="settings-card-chevron"></i>
+        </button>
+        <div class="settings-card-body">
+          <div style="display:flex;gap:8px;margin-bottom:8px;">
+            <button id="toolsEnableAllBtn" class="input-modern" style="flex:1;cursor:pointer;font-weight:600;display:flex;align-items:center;justify-content:center;gap:6px;font-size:11px;">
+              <i data-lucide="check-circle" style="width:12px;height:12px;"></i> Включить все
+            </button>
+            <button id="toolsDisableAllBtn" class="input-modern" style="flex:1;cursor:pointer;font-weight:600;display:flex;align-items:center;justify-content:center;gap:6px;font-size:11px;">
+              <i data-lucide="x-circle" style="width:12px;height:12px;"></i> Отключить все
+            </button>
+          </div>
+          <div id="builtinToolsList" style="display:flex;flex-direction:column;gap:1px;"></div>
+          <div class="settings-hint" style="margin-top:8px;">
+            Отключённые инструменты не будут отправляться модели. Это позволяет уменьшить контекст или запретить определённые действия.
+          </div>
+        </div>
+      </div><!-- /settings-card Инструменты -->
+
       <!-- ══ ТЕРМИНАЛ ══ -->
       <div class="settings-card">
         <button class="settings-card-header" onclick="toggleSettingsCard(this)">
@@ -7403,6 +7427,41 @@ function escapeHtml(text) {
   div.textContent = text;
   return div.innerHTML;
 }
+/* ========= Управление встроенными инструментами (Tools toggle) ========= */
+const disabledBuiltinTools = new Set(
+  JSON.parse(localStorage.getItem('agent_disabled_builtin_tools') || '[]')
+);
+
+function saveDisabledBuiltinTools() {
+  localStorage.setItem('agent_disabled_builtin_tools', JSON.stringify(Array.from(disabledBuiltinTools)));
+}
+
+function toggleBuiltinTool(toolName, enabled) {
+  if (enabled) disabledBuiltinTools.delete(toolName);
+  else disabledBuiltinTools.add(toolName);
+  saveDisabledBuiltinTools();
+  renderBuiltinToolsList();
+}
+
+function renderBuiltinToolsList() {
+  const container = document.getElementById('builtinToolsList');
+  if (!container) return;
+  const total = toolDefs.length;
+  const enabledCount = total - disabledBuiltinTools.size;
+  const badge = document.getElementById('toolsHeaderBadge');
+  if (badge) badge.textContent = `${enabledCount}/${total}`;
+  container.innerHTML = toolDefs.map(t => {
+    const name = t.function.name;
+    const desc = (t.function.description || '').split('\n')[0].slice(0, 120);
+    const checked = !disabledBuiltinTools.has(name);
+    return `<label style="display:flex;align-items:center;gap:8px;padding:5px 8px;font-size:11px;color:var(--text-1);cursor:pointer;border-radius:var(--r-xs);transition:background .15s;" onmouseenter="this.style.background='var(--bg-hover)'" onmouseleave="this.style.background=''" title="${escapeHtml(desc)}">
+      <input type="checkbox" data-builtin-tool-toggle data-tool-name="${escapeHtml(name)}" ${checked ? 'checked' : ''} style="margin:0;cursor:pointer;flex-shrink:0;" />
+      <span style="font-family:var(--font-mono);font-weight:500;min-width:100px;">${escapeHtml(name)}</span>
+      <span style="color:var(--text-2);font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(desc)}</span>
+    </label>`;
+  }).join('');
+}
+
 /* ========= Инструменты для модели ========= */
 const toolDefs = [
   {
@@ -7779,7 +7838,7 @@ function buildSkillToolDef() {
 }
 
 function getToolDefsWithSkills() {
-  const base = [...toolDefs];
+  const base = toolDefs.filter(t => !disabledBuiltinTools.has(t.function.name));
   const skillDef = buildSkillToolDef();
   if (skillDef) base.push(skillDef);
   return base;
@@ -15047,6 +15106,26 @@ const MCPUI = (() => {
 })();
 
 document.addEventListener('DOMContentLoaded', () => { try { MCPUI.init(); } catch (e) { console.error('[MCP-UI]', e); } });
+
+/* ========= BUILTIN TOOLS UI ========= */
+document.addEventListener('DOMContentLoaded', () => {
+  renderBuiltinToolsList();
+  document.getElementById('builtinToolsList')?.addEventListener('change', (e) => {
+    if (e.target.matches('[data-builtin-tool-toggle]')) {
+      toggleBuiltinTool(e.target.dataset.toolName, e.target.checked);
+    }
+  });
+  document.getElementById('toolsEnableAllBtn')?.addEventListener('click', () => {
+    disabledBuiltinTools.clear();
+    saveDisabledBuiltinTools();
+    renderBuiltinToolsList();
+  });
+  document.getElementById('toolsDisableAllBtn')?.addEventListener('click', () => {
+    toolDefs.forEach(t => disabledBuiltinTools.add(t.function.name));
+    saveDisabledBuiltinTools();
+    renderBuiltinToolsList();
+  });
+});
 
 /* ========= SETTINGS ACCORDION ========= */
 (function initSettingsAccordion() {
