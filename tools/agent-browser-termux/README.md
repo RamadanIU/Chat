@@ -139,13 +139,13 @@ Chromium стартовал но сразу умер. Проверьте, что
 
 ### `net::ERR_ABORTED` при `agent-browser open`
 
-Базовые args шима уже включают `--disable-web-security`, что обычно решает эту проблему на Termux Chromium 138 (так рекомендует ваш скилл). Если всё равно падает:
+На Termux Chromium 138 (и аналогичных Android-сборках) Chromium не может форкать utility/network-service процессы без root, из-за чего `page.goto` всегда возвращает `ERR_ABORTED`. Шим решает это флагом `--single-process` в дефолтных args. Если падает:
 
-1. Проверьте, что у вас актуальная версия шима:
+1. Проверьте, что в установленном `daemon.js` есть `--single-process`:
    ```bash
-   grep -c disable-web-security ~/playwright-termux/agent-browser-shim/daemon.js
+   grep -c single-process ~/playwright-termux/agent-browser-shim/daemon.js
    ```
-   Должно вывести `2`. Если `0` — скрипт `install.sh` скачал устаревшую копию из кеша GitHub. Перекачайте напрямую с cache-busting:
+   Должно вывести `>=1`. Если `0` — `install.sh` скачал устаревшую копию из кеша GitHub. Перекачайте с cache-bust:
    ```bash
    agent-browser kill
    curl -fsSL "https://raw.githubusercontent.com/RamadanIU/Chat/main/tools/agent-browser-termux/daemon.js?$(date +%s)" -o ~/playwright-termux/agent-browser-shim/daemon.js

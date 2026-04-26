@@ -155,8 +155,8 @@ fi
 chmod +x "${SHIM_DIR}/daemon.js" "${SHIM_DIR}/cli.js"
 
 # ── Sanity check: ensure we got the current code, not a cached old copy ────
-if ! grep -q 'disable-web-security' "${SHIM_DIR}/daemon.js" 2>/dev/null; then
-  err "daemon.js does not contain the expected '--disable-web-security' arg."
+if ! grep -q "AGENT_BROWSER_SINGLE_PROCESS" "${SHIM_DIR}/daemon.js" 2>/dev/null; then
+  err "daemon.js does not contain expected 'AGENT_BROWSER_SINGLE_PROCESS' marker."
   err "  This usually means GitHub returned a cached old version of the file."
   err "  Try again in a minute, or pin to the latest commit:"
   err "    AGENT_BROWSER_REF=main bash <(curl -sL ${RAW}/install.sh?\$RANDOM)"

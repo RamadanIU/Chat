@@ -101,9 +101,7 @@ function ensureBrowser() {
 async function _ensureBrowserInner() {
   if (browser && browser.isConnected && browser.isConnected() && pages.length) return;
 
-  // Match the args from the user's tested ~/playwright-termux skill, plus
-  // --disable-web-security which the same skill explicitly recommends as the
-  // remedy for `net::ERR_ABORTED` during page.goto on Termux Chromium 138.
+  // Base args match the user's tested ~/playwright-termux skill.
   // Anything beyond these has historically broken Termux Chromium
   // (e.g. --no-zygote, --disable-features=site-per-process).
   // Extra args can be added via AGENT_BROWSER_EXTRA_ARGS env var (space-separated).
@@ -111,8 +109,21 @@ async function _ensureBrowserInner() {
     '--no-sandbox',
     '--disable-gpu',
     '--disable-dev-shm-usage',
-    '--disable-web-security',
   ];
+
+  // Termux Chromium 138 (and similar Android-side builds) cannot spawn
+  // utility / network-service subprocesses without root, which causes
+  // every page.goto() to fail with `net::ERR_ABORTED` even though the
+  // browser itself launches fine. `--single-process` collapses Chromium
+  // into one process and is the documented workaround.
+  // On regular Linux Chromium that flag *breaks* startup, so only add
+  // it when we're running on Termux (or when the user forces it via env).
+  const isTermux = !!(process.env.PREFIX && process.env.PREFIX.includes('com.termux'))
+    || fs.existsSync('/data/data/com.termux/files/usr');
+  const sp = (process.env.AGENT_BROWSER_SINGLE_PROCESS || 'auto').toLowerCase();
+  const useSingleProcess = sp === '1' || sp === 'true' || sp === 'on'
+    || (sp === 'auto' && isTermux);
+  if (useSingleProcess) baseArgs.push('--single-process');
   const extra = (process.env.AGENT_BROWSER_EXTRA_ARGS || '').trim().split(/\s+/).filter(Boolean);
   const launchOpts = {
     headless: HEADLESS,
@@ -137,8 +148,8 @@ async function _ensureBrowserInner() {
 
   // Keep newContext options minimal — the user's tested test-launch.js
   // calls browser.newPage() with no explicit context options. Adding
-  // viewport / ignoreHTTPSErrors here has been observed to cause
-  // net::ERR_ABORTED on Termux Chromium 138 even with --disable-web-security.
+  // viewport / ignoreHTTPSErrors at context level has been observed to
+  // perturb the first navigation on Termux Chromium 138.
   // Apply viewport later via page.setViewportSize() so the initial
   // navigation runs in the most-default state possible.
   const ctxOpts = {};
