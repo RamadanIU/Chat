@@ -4,7 +4,8 @@
   "description": "Простой WebSocket PTY-сервер — замена ttyd",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
+    "start": "bash start.sh",
+    "term": "node server.js",
     "dev": "PORT=8765 node server.js"
   },
   "dependencies": {
