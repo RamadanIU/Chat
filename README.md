@@ -65,6 +65,47 @@ npm start
 После запуска откройте в браузере <http://localhost:8080> — это и есть UI чата.
 Завершить всё — `Ctrl+C` в том же терминале.
 
+### Логин и пароль (HTTP Basic Auth)
+
+Frontend `http://localhost:8080` защищён HTTP Basic Auth. Дефолтные креды:
+
+| | |
+| --- | --- |
+| **Login** | `Ramadan` |
+| **Password** | `Bismillah2021` |
+
+Переопределить можно через переменные окружения перед запуском:
+
+```bash
+AUTH_USER=alice AUTH_PASSWORD=s3cret bash start.sh
+```
+
+Полностью отключить:
+
+```bash
+AUTH_DISABLE=1 bash start.sh
+```
+
+Браузер один раз спросит креды и закеширует их в рамках сессии.
+
+### Daemon-режим (запуск переживает закрытие терминала)
+
+Если хочется, чтобы все сервисы продолжили работать **после закрытия окна
+терминала**, используйте подкоманды:
+
+```bash
+bash start.sh start     # фоновый запуск (отвязанный от tty); пишет лог в ~/.cache/chat-stack/daemon.log
+bash start.sh status    # показать состояние и адреса
+bash start.sh logs      # tail -f лога
+bash start.sh stop      # корректно остановить (SIGTERM → дерево процессов)
+bash start.sh restart   # stop + start
+```
+
+Внутри `start` использует `setsid + nohup`, поэтому процесс отвязывается от
+сессии терминала и переживает `Ctrl+D` / закрытие окна. PID хранится в
+`~/.cache/chat-stack/daemon.pid`. Без подкоманды (просто `bash start.sh`)
+сервисы стартуют как раньше — в foreground, и Ctrl+C их останавливает.
+
 ### Системные пакеты, если что-то упало
 
 | Симптом | Решение |
@@ -115,6 +156,9 @@ npm start
 | `WORKSPACE_DIR` | `~/workspace` (или `~/storage/shared/workspace` на Termux) | Корневая папка файлового API. |
 | `WORKSPACE_ROOTS` | `$HOME` | `:`-разделённый список разрешённых корней для смены рабочей области через UI. |
 | `TOKEN` | _пусто_ | Если задан — терминал-сервер требует `?token=...` в WebSocket-URL. |
+| `AUTH_USER` | `Ramadan` | Логин HTTP Basic Auth на frontend. |
+| `AUTH_PASSWORD` | `Bismillah2021` | Пароль HTTP Basic Auth на frontend. |
+| `AUTH_DISABLE` | _не задан_ | `1` — полностью отключить авторизацию. |
 
 Пример с другими портами:
 
