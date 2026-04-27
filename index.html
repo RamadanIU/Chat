@@ -4,6 +4,26 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <title>Agent Pro</title>
+<!-- AGENT_PRO_RUNTIME_CONFIG_INJECT -->
+<!-- AGENT_PRO_DEFAULTS: значения по умолчанию для Терминала и Файловой системы.
+     run.py подставляет сюда актуальные порты из окружения (TERM_PORT / WORKSPACE_PORT)
+     через маркер AGENT_PRO_RUNTIME_CONFIG_INJECT выше. Если index.html открыт напрямую
+     (file:// или сторонний хостинг) — используется fallback на localhost. -->
+<script>
+(function () {
+  var loc = (typeof window !== 'undefined' && window.location) ? window.location : {};
+  var fallbackHost = (loc.hostname && loc.hostname !== '' && loc.protocol !== 'file:') ? loc.hostname : 'localhost';
+  var injected = (typeof window !== 'undefined' && window.AGENT_PRO_DEFAULTS) || {};
+  window.AGENT_PRO_DEFAULTS = {
+    termUrl:    injected.termUrl    || ('ws://'   + fallbackHost + ':8765'),
+    wsApiUrl:   injected.wsApiUrl   || ('http://' + fallbackHost + ':8764'),
+    bridgeUrl:  injected.bridgeUrl  || ('ws://127.0.0.1:7777'),
+    termPort:   injected.termPort   || 8765,
+    wsApiPort:  injected.wsApiPort  || 8764,
+    bridgePort: injected.bridgePort || 7777
+  };
+})();
+</script>
 <script src="https://unpkg.com/lucide@latest"></script>
 <script src="https://js.puter.com/v2/"></script>
 <link rel="stylesheet" href="https://unpkg.com/xterm@5.3.0/css/xterm.css"/>
@@ -4727,7 +4747,7 @@ button:disabled, .icon-btn:disabled, input:disabled, textarea:disabled {
 
           <div class="setting-row">
             <label>URL сервера</label>
-            <input id="termHost" type="text" class="input-modern" placeholder="ws://ваш-сервер:8765" />
+            <input id="termHost" type="text" class="input-modern" placeholder="ws://localhost:8765" />
           </div>
           <div class="setting-row">
             <label>Токен</label>
@@ -4801,7 +4821,7 @@ button:disabled, .icon-btn:disabled, input:disabled, textarea:disabled {
           <div class="ws-backend-panel" id="wsPanelServer" style="display:none;">
             <div class="setting-row">
               <label>URL сервера</label>
-              <input id="wsApiUrl" type="text" class="input-modern" placeholder="http://ваш-сервер/wsapi" />
+              <input id="wsApiUrl" type="text" class="input-modern" placeholder="http://localhost:8764" />
             </div>
             <div class="setting-row">
               <label>Credentials</label>
@@ -5506,14 +5526,27 @@ function loadSettings() {
   document.getElementById('ttsProvider').value = ttsProvider;
   updateTtsVoiceOptions(ttsProvider);
   document.getElementById('ttsVoice').value = ttsVoice;
-  // Terminal server
-  var tHost = localStorage.getItem('agent_term_host') || '';
+  // Terminal server. На первом запуске подставляем нативный URL из AGENT_PRO_DEFAULTS,
+  // чтобы из коробки работал терминал на ws://localhost:<TERM_PORT> без ручной настройки.
+  var DEFAULTS = (window.AGENT_PRO_DEFAULTS || {});
+  var rawTermHost = localStorage.getItem('agent_term_host');
+  var tHost = rawTermHost;
+  if (rawTermHost === null || rawTermHost === '') {
+    tHost = DEFAULTS.termUrl || '';
+    if (tHost) localStorage.setItem('agent_term_host', tHost);
+  }
   // Не нормализуем termHost через https — там нужен ws:// или wss://
-  document.getElementById('termHost').value = tHost;
+  document.getElementById('termHost').value = tHost || '';
   document.getElementById('termCreds').value = localStorage.getItem('agent_term_creds') || '';
-  // Workspace API
-  var savedWsUrl = localStorage.getItem('agent_ws_api_url') || '';
-  document.getElementById('wsApiUrl').value = savedWsUrl;
+  // Workspace API. Аналогично — подставляем дефолт http://localhost:<WORKSPACE_PORT>,
+  // чтобы Server FS поднялся автоматически (см. VFS.init).
+  var rawWsUrl = localStorage.getItem('agent_ws_api_url');
+  var savedWsUrl = rawWsUrl;
+  if (rawWsUrl === null || rawWsUrl === '') {
+    savedWsUrl = DEFAULTS.wsApiUrl || '';
+    if (savedWsUrl) localStorage.setItem('agent_ws_api_url', savedWsUrl);
+  }
+  document.getElementById('wsApiUrl').value = savedWsUrl || '';
   const savedWsAuth = localStorage.getItem('agent_ws_api_auth') || '';
   document.getElementById('wsApiAuth').value = savedWsAuth;
   // Connection status shown after VFS.init() in main()

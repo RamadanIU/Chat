@@ -169,10 +169,42 @@ class Service:
 
 
 # ── Встроенный статический сервер для index.html ─────────────────────────────
+RUNTIME_CONFIG_MARKER = "<!-- AGENT_PRO_RUNTIME_CONFIG_INJECT -->"
+
+
+def _runtime_config_payload(host_for_browser: str) -> dict:
+    """Значения, которые index.html подхватит как window.AGENT_PRO_DEFAULTS.
+
+    Используются как нативные дефолты для полей «Терминал» и «Файловая система»
+    в настройках, чтобы из коробки работало подключение на ws://<host>:<TERM_PORT>
+    и http://<host>:<WORKSPACE_PORT> без ручного ввода.
+    """
+    return {
+        "termUrl": f"ws://{host_for_browser}:{TERM_PORT}",
+        "wsApiUrl": f"http://{host_for_browser}:{WORKSPACE_PORT}",
+        "bridgeUrl": f"ws://{BRIDGE_HOST}:{BRIDGE_PORT}",
+        "termPort": TERM_PORT,
+        "wsApiPort": WORKSPACE_PORT,
+        "bridgePort": BRIDGE_PORT,
+    }
+
+
+def _build_runtime_config_script(host_for_browser: str) -> str:
+    import json as _json
+    payload = _runtime_config_payload(host_for_browser)
+    return (
+        "<script>window.AGENT_PRO_DEFAULTS = "
+        + _json.dumps(payload, ensure_ascii=False)
+        + ";</script>"
+    )
+
+
 class FrontendHandler(http.server.SimpleHTTPRequestHandler):
     """Отдаёт index.html и прочие статические файлы из корня репо.
 
     Если задан _AUTH_TOKEN — каждый запрос требует HTTP Basic Auth.
+    Дополнительно в index.html подставляются нативные адреса локальных сервисов
+    (терминал, Workspace API), чтобы UI знал, к чему подключаться из коробки.
     """
 
     def __init__(self, *args, **kwargs):
@@ -203,9 +235,61 @@ class FrontendHandler(http.server.SimpleHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
+    # ── Helpers ──────────────────────────────────────────────────────────────
+    def _is_index_request(self) -> bool:
+        path = self.path.split("?", 1)[0].split("#", 1)[0]
+        return path in ("/", "/index.html")
+
+    def _host_for_browser(self) -> str:
+        """Хост, который браузер должен использовать для ws://termUrl и http://wsApiUrl.
+
+        Берём из заголовка Host (то, что написано в адресной строке),
+        отрезая порт. Если HOST=0.0.0.0/:: и заголовка нет — вернём 'localhost'.
+        """
+        raw = self.headers.get("Host", "") or ""
+        # IPv6 в Host: [::1]:8080
+        if raw.startswith("["):
+            end = raw.find("]")
+            if end != -1:
+                return raw[1:end] or "localhost"
+        host = raw.split(":", 1)[0].strip()
+        if host and host not in ("0.0.0.0", "::"):
+            return host
+        return "localhost"
+
+    def _serve_index(self) -> None:
+        index_path = ROOT / "index.html"
+        try:
+            raw = index_path.read_bytes()
+        except OSError as exc:
+            self.send_error(500, f"index.html unavailable: {exc}")
+            return
+
+        host_for_browser = self._host_for_browser()
+        injection = _build_runtime_config_script(host_for_browser)
+        marker_b = RUNTIME_CONFIG_MARKER.encode("utf-8")
+        if marker_b in raw:
+            patched = raw.replace(marker_b, injection.encode("utf-8"), 1)
+        else:
+            # Маркера нет (например, старая копия файла) — просто отдаём как есть.
+            patched = raw
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(patched)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        try:
+            self.wfile.write(patched)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
     def do_GET(self) -> None:  # noqa: N802
         if not self._authorized():
             self._challenge()
+            return
+        if self._is_index_request():
+            self._serve_index()
             return
         super().do_GET()
 
