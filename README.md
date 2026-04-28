@@ -65,6 +65,13 @@ npm start
 После запуска откройте в браузере <http://localhost:8080> — это и есть UI чата.
 Завершить всё — `Ctrl+C` в том же терминале.
 
+> **Закрытие окна терминала не убивает сервисы** даже в foreground-режиме:
+> `run.py` игнорирует `SIGHUP`, а дочерние сервисы (`workspace`, `terminal`,
+> `bridge`, `frontend`) живут в отдельных process group'ах через `setsid` и
+> tty-сигналы не получают. Чтобы корректно остановить стек после закрытия окна,
+> используйте `bash start.sh stop` (если запускали как daemon) или
+> `bash start.sh cleanup` / `kill <pid run.py>`.
+
 ### Логин и пароль (HTTP Basic Auth)
 
 Frontend `http://localhost:8080` защищён HTTP Basic Auth. Дефолтные креды:

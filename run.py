@@ -96,7 +96,13 @@ USE_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
 def log(name: str, line: str) -> None:
     color = COLORS.get(name, "") if USE_COLOR else ""
     reset = RESET if USE_COLOR else ""
-    print(f"{color}[{name:<9}]{reset} {line}", flush=True)
+    # Глотаем любые ошибки записи в stdout: при закрытии окна терминала наш
+    # tty уезжает, write() может бросить BrokenPipeError/OSError. Это не повод
+    # ронять supervisor — сервисы в своих setsid-группах живут дальше.
+    try:
+        print(f"{color}[{name:<9}]{reset} {line}", flush=True)
+    except Exception:
+        pass
 
 
 # ── Помощники: state-файл и убийство сирот ───────────────────────────────────
@@ -764,8 +770,14 @@ def main(argv: list[str] | None = None) -> int:
 
     signal.signal(signal.SIGINT, on_signal)
     signal.signal(signal.SIGTERM, on_signal)
+    # SIGHUP сознательно ИГНОРИРУЕМ. Закрытие окна терминала (в foreground-режиме
+    # `bash start.sh` / `npm start`) приходит сюда как SIGHUP — раньше мы по нему
+    # гасили весь стек, включая bridge. Теперь run.py остаётся жить, а дочерние
+    # сервисы и так лежат в отдельных process group'ах через os.setsid и
+    # SIGHUP от tty не получают. Остановка — только по явному SIGINT/SIGTERM
+    # (Ctrl+C, `bash start.sh stop`, kill).
     if hasattr(signal, "SIGHUP"):
-        signal.signal(signal.SIGHUP, on_signal)
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
 
     # Старт
     try:
