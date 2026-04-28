@@ -11,6 +11,8 @@
 #   bash start.sh restart          — stop + start.
 #   bash start.sh logs             — tail -f лога daemon-а.
 #   bash start.sh run              — то же что без аргументов (foreground).
+#   bash start.sh doctor           — диагностика: кто держит порты + state-файл.
+#   bash start.sh cleanup          — освободить порты, прибить сирот предыдущего запуска.
 #
 # Флаги (для foreground / start):
 #   --no-browser     не ставить agent-browser shim.
@@ -58,7 +60,7 @@ PASSTHROUGH=()
 
 if [ $# -gt 0 ]; then
   case "$1" in
-    start|stop|status|restart|logs|run) CMD="$1"; shift ;;
+    start|stop|status|restart|logs|run|doctor|cleanup) CMD="$1"; shift ;;
   esac
 fi
 
@@ -80,6 +82,61 @@ is_running() {
   local pid; pid=$(cat "$PID_FILE" 2>/dev/null || echo "")
   [ -n "$pid" ] || return 1
   kill -0 "$pid" 2>/dev/null
+}
+
+# Освободить порты и прибить «сирот» предыдущего запуска (best-effort).
+# Делегируем в run.py --cleanup-only — он умеет читать state-файл, валить
+# по PGID, и через lsof/ss/fuser освобождать порты.
+cleanup_stale() {
+  prepare_runtime_env >/dev/null 2>&1 || true
+  local PYBIN
+  if [ -x ".venv/bin/python" ]; then
+    PYBIN=".venv/bin/python"
+  elif command -v python3 >/dev/null 2>&1; then
+    PYBIN="python3"
+  else
+    PYBIN="python"
+  fi
+  "$PYBIN" "${ROOT}/run.py" --cleanup-only 2>&1 \
+    | sed 's/^/[cleanup] /' || true
+}
+
+# Watchdog: в daemon-режиме перезапускает run.py при ненулевом коде выхода
+# (не чаще 5 раз за минуту, чтобы при сломанной конфигурации не крутиться вечно).
+print_watchdog_script() {
+  cat <<'WATCHDOG_EOF'
+#!/usr/bin/env bash
+set -u
+cd "${AGENT_PRO_ROOT}"
+if [ -d .venv ]; then
+  # shellcheck disable=SC1091
+  . .venv/bin/activate
+fi
+attempts=0
+window_start=$(date +%s)
+echo "[watchdog] started pid=$$ root=${AGENT_PRO_ROOT}"
+while true; do
+  python "${AGENT_PRO_ROOT}/run.py" --cleanup-only || true
+  python "${AGENT_PRO_ROOT}/run.py" "$@"
+  rc=$?
+  if [ $rc -eq 0 ]; then
+    echo "[watchdog] run.py вышел штатно (rc=0), завершаю watchdog."
+    break
+  fi
+  now=$(date +%s)
+  if [ $((now - window_start)) -ge 60 ]; then
+    window_start=$now
+    attempts=0
+  fi
+  attempts=$((attempts + 1))
+  delay=2
+  if [ $attempts -ge 3 ]; then delay=5; fi
+  if [ $attempts -ge 5 ]; then delay=15; fi
+  if [ $attempts -ge 8 ]; then delay=60; fi
+  echo "[watchdog] run.py упал rc=$rc (попыток за минуту: $attempts). Рестарт через ${delay}s…"
+  sleep "$delay"
+done
+WATCHDOG_EOF
 }
 
 # ── Окружение ────────────────────────────────────────────────────────────────
@@ -277,16 +334,26 @@ cmd_start() {
   fi
   install_deps
   prepare_runtime_env
+  # Прибить любых сирот предыдущего запуска и освободить порты ДО старта.
+  cleanup_stale
 
   echo
   bold "запускаю фоновый daemon (PID-файл: $PID_FILE, лог: $LOG_FILE)"
   : > "$LOG_FILE"
-  # setsid + nohup отвязывают процесс от текущей сессии терминала, чтобы он
-  # пережил закрытие окна. stdin закрываем (</dev/null), stdout/stderr → лог.
+
+  # ВНЕШНИЙ watchdog: bash-цикл, который перезапускает run.py если он сам упал.
+  # PID в PID_FILE — pid этого watchdog-цикла. setsid + nohup отвязывают его от
+  # tty, чтобы он пережил закрытие окна.
+  local WATCHDOG_SCRIPT="${RUN_DIR}/watchdog.sh"
+  print_watchdog_script > "$WATCHDOG_SCRIPT"
+  chmod +x "$WATCHDOG_SCRIPT"
+
   if command -v setsid >/dev/null 2>&1; then
-    setsid nohup python "${ROOT}/run.py" "${PASSTHROUGH[@]:-}" </dev/null >>"$LOG_FILE" 2>&1 &
+    AGENT_PRO_ROOT="${ROOT}" setsid nohup bash "$WATCHDOG_SCRIPT" ${PASSTHROUGH[@]+"${PASSTHROUGH[@]}"} \
+      </dev/null >>"$LOG_FILE" 2>&1 &
   else
-    nohup python "${ROOT}/run.py" "${PASSTHROUGH[@]:-}" </dev/null >>"$LOG_FILE" 2>&1 &
+    AGENT_PRO_ROOT="${ROOT}" nohup bash "$WATCHDOG_SCRIPT" ${PASSTHROUGH[@]+"${PASSTHROUGH[@]}"} \
+      </dev/null >>"$LOG_FILE" 2>&1 &
   fi
   echo $! > "$PID_FILE"
   disown 2>/dev/null || true
@@ -316,12 +383,15 @@ cmd_stop() {
   if ! is_running; then
     warn "Daemon не запущен."
     rm -f "$PID_FILE"
+    # Всё равно дочистим — на случай если PID-файл потёрли руками, а дети живы.
+    cleanup_stale
     return 0
   fi
   local pid; pid=$(cat "$PID_FILE")
   info "останавливаю daemon (pid=$pid)…"
-  # run.py обрабатывает SIGTERM → корректно гасит всё дерево.
-  kill -TERM "$pid" 2>/dev/null || true
+  # Вначале гасим всю process group watchdog-а (а с ней и дочерний run.py с детьми).
+  # Если pid в группе == pid процесса (типичный случай setsid), это покрывает всё.
+  kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
   local i=0
   while [ $i -lt 50 ] && kill -0 "$pid" 2>/dev/null; do
     sleep 0.2
@@ -329,9 +399,11 @@ cmd_stop() {
   done
   if kill -0 "$pid" 2>/dev/null; then
     warn "не остановился по TERM, шлю KILL"
-    kill -KILL "$pid" 2>/dev/null || true
+    kill -KILL -"$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
   fi
   rm -f "$PID_FILE"
+  # Финальная подчистка: если кто-то из детей пережил (стал сиротой) — добьём.
+  cleanup_stale
   ok "Daemon остановлен."
 }
 
@@ -355,9 +427,42 @@ cmd_logs() {
 cmd_run() {
   install_deps
   prepare_runtime_env
+  cleanup_stale
   echo
   bold "запускаю все сервисы (Ctrl+C — остановить):"
-  exec python run.py "${PASSTHROUGH[@]:-}"
+  exec python run.py ${PASSTHROUGH[@]+"${PASSTHROUGH[@]}"}
+}
+
+cmd_doctor() {
+  prepare_runtime_env >/dev/null 2>&1 || true
+  bold "doctor — состояние стека"
+  print_status
+  echo
+  echo "── Кто слушает наши порты ──"
+  local PORTS="${FRONTEND_PORT:-8080} ${WORKSPACE_PORT:-8764} ${TERM_PORT:-8765} ${BRIDGE_PORT:-7777}"
+  for p in $PORTS; do
+    echo "port $p:"
+    if command -v lsof >/dev/null 2>&1; then
+      lsof -nP -iTCP:"$p" -sTCP:LISTEN 2>/dev/null | sed 's/^/  /' || true
+    elif command -v ss >/dev/null 2>&1; then
+      ss -ltnp "sport = :$p" 2>/dev/null | sed 's/^/  /' || true
+    elif command -v fuser >/dev/null 2>&1; then
+      fuser -n tcp "$p" 2>/dev/null | sed 's/^/  /' || true
+    fi
+  done
+  echo
+  echo "── State-файл (${RUN_DIR}/children.json) ──"
+  if [ -f "${RUN_DIR}/children.json" ]; then
+    cat "${RUN_DIR}/children.json" | sed 's/^/  /'
+  else
+    echo "  (нет — daemon не запущен или прошлый запуск завершился штатно)"
+  fi
+}
+
+cmd_cleanup() {
+  prepare_runtime_env >/dev/null 2>&1 || true
+  cleanup_stale
+  ok "cleanup завершён."
 }
 
 # ── Dispatch ────────────────────────────────────────────────────────────────
@@ -367,5 +472,7 @@ case "$CMD" in
   status)  cmd_status  ;;
   restart) cmd_restart ;;
   logs)    cmd_logs    ;;
+  doctor)  cmd_doctor  ;;
+  cleanup) cmd_cleanup ;;
   run|*)   cmd_run     ;;
 esac
