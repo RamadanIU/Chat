@@ -2490,6 +2490,30 @@ textarea::placeholder { color: var(--text-3); }
   padding: 2px 20px 20px;
 }
 
+/* Stagger-анимация появления карточек при открытии панели настроек.
+   Применяется только во время отдельного «open» — через класс .entering
+   на #settingsPanel, который снимается после завершения. */
+@keyframes settingsCardEnter {
+  from { opacity: 0; transform: translateY(-10px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+#settingsPanel.entering .settings-container > .settings-card {
+  animation: settingsCardEnter 0.34s cubic-bezier(0.4,0,0.2,1) both;
+}
+#settingsPanel.entering .settings-container > .settings-card:nth-child(1)  { animation-delay: 0.02s; }
+#settingsPanel.entering .settings-container > .settings-card:nth-child(2)  { animation-delay: 0.05s; }
+#settingsPanel.entering .settings-container > .settings-card:nth-child(3)  { animation-delay: 0.08s; }
+#settingsPanel.entering .settings-container > .settings-card:nth-child(4)  { animation-delay: 0.11s; }
+#settingsPanel.entering .settings-container > .settings-card:nth-child(5)  { animation-delay: 0.14s; }
+#settingsPanel.entering .settings-container > .settings-card:nth-child(6)  { animation-delay: 0.17s; }
+#settingsPanel.entering .settings-container > .settings-card:nth-child(7)  { animation-delay: 0.20s; }
+#settingsPanel.entering .settings-container > .settings-card:nth-child(8)  { animation-delay: 0.23s; }
+#settingsPanel.entering .settings-container > .settings-card:nth-child(9)  { animation-delay: 0.26s; }
+#settingsPanel.entering .settings-container > .settings-card:nth-child(10) { animation-delay: 0.29s; }
+@media (prefers-reduced-motion: reduce) {
+  #settingsPanel.entering .settings-container > .settings-card { animation: none; }
+}
+
 /* Divider between sections */
 .settings-card + .settings-card::before {
   content: '';
@@ -12756,18 +12780,36 @@ async function runAgent(userText) {
 }
 /* ========= Обработчики UI ========= */
 document.getElementById('saveKey').addEventListener('click', () => {
-  const key = document.getElementById('apiKey').value.trim();
-  if (!key) {
-    setStatus('Введите ключ', 'error');
-    return;
-  }
-  if (saveCurrentKey()) {
+  // Кнопка «Сохранить» закрывает все настройки сразу: ключ провайдера (если
+  // ввели новый) + все остальные поля. Раньше при пустом поле ключа
+  // обработчик возвращался досрочно и не вызывал saveSettings(), из-за чего
+  // флаг «несохранённых изменений» не сбрасывался — после Сохранить → крестик
+  // диалог снова просил сохранить.
+  const provider = document.getElementById('provider').value;
+  const apiKeyInput = document.getElementById('apiKey');
+  const key = (apiKeyInput?.value || '').trim();
+  const hadSavedKey = !!localStorage.getItem(`agent_key_${provider}`);
+  const isPuter = provider === 'puter';
+
+  let savedNewKey = false;
+  if (key && saveCurrentKey()) {
+    savedNewKey = true;
     updateKeyIndicator();
-    saveSettings();
+  }
+
+  // Сохраняем все остальные настройки и диспатчим settings:saved — это
+  // снимает индикатор «несохранённых изменений».
+  saveSettings();
+
+  if (savedNewKey) {
     setStatus('✅ Ключ сохранён', 'ok');
     loadModels();
-    setTimeout(() => setStatus('Готово', 'ok'), 2000);
+  } else if (isPuter || hadSavedKey) {
+    setStatus('✅ Настройки сохранены', 'ok');
+  } else {
+    setStatus('Настройки сохранены, но API-ключ не задан', 'warning');
   }
+  setTimeout(() => setStatus('Готово', 'ok'), 2000);
 });
 document.getElementById('clearWS').addEventListener('click', async () => {
   if (!confirm('Очистить workspace?')) return;
@@ -13345,8 +13387,29 @@ function refreshOpenAccordions() {
   function openSettings() {
     document.getElementById('planPopover')?.classList.remove('open');
     document.getElementById('popoverBackdrop')?.classList.remove('open');
+
+    // При открытии панели всегда сворачиваем все карточки, чтобы пользователь
+    // видел общий список и сам выбирал, что раскрыть.
+    panel.querySelectorAll('.settings-card.open').forEach(card => {
+      card.classList.remove('open');
+      const body = card.querySelector('.settings-card-body');
+      if (body) {
+        body.style.maxHeight = '0';
+        body.style.overflow = 'hidden';
+      }
+    });
+
     panel.classList.add(window.innerWidth > 768 ? 'desktop-visible' : 'mobile-visible');
     document.getElementById('settingsBackdrop')?.classList.add('open');
+
+    // Stagger-анимация появления карточек: добавляем .entering, рестартуем
+    // анимации сменой класса и убираем флаг по завершении самой длинной из них.
+    panel.classList.remove('entering');
+    void panel.offsetWidth; // force reflow → перезапуск keyframes
+    panel.classList.add('entering');
+    clearTimeout(openSettings._enterTimer);
+    openSettings._enterTimer = setTimeout(() => panel.classList.remove('entering'), 800);
+
     markClean(); // reset dirty on each open
   }
 
@@ -16071,20 +16134,11 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 });
 
-/* ========= SETTINGS ACCORDION ========= */
+/* ========= SETTINGS ACCORDION =========
+   Все карточки начинаются свёрнутыми — пользователь сам решает, что
+   раскрыть. (Раньше первая карточка «Нейросеть» автоматически открывалась.) */
 (function initSettingsAccordion() {
   function setup() {
-    const first = document.querySelector('#settingsPanel .settings-card');
-    if (first) {
-      first.classList.add('open');
-      const body = first.querySelector('.settings-card-body');
-      if (body) {
-        requestAnimationFrame(() => {
-          body.style.maxHeight = 'none';
-          body.style.overflow = 'visible';
-        });
-      }
-    }
     if (window.lucide) window.lucide.createIcons();
   }
   if (document.readyState !== 'loading') setup();
