@@ -24,6 +24,308 @@
   };
 })();
 </script>
+
+<!-- ════════════════════════ MEMORY BACKEND ════════════════════════
+     Сюда переезжает «память» приложения: чаты, скилы, MCP-серверы и все
+     настройки `agent_*`, которые раньше жили только в браузерном
+     localStorage. Поддерживаются два режима:
+
+       • browser — historical default, всё в localStorage;
+       • db      — то же localStorage, но каждое изменение зеркалится в
+                   серверную SQLite (POST /mem/sync), а на старте
+                   localStorage синхронно подтягивается из БД (/mem/export).
+
+     Реализовано как монки-патч `Storage.prototype.setItem/removeItem`,
+     чтобы не переписывать ~89 точек обращения к localStorage в этом файле.
+     ──────────────────────────────────────────────────────────────── -->
+<script>
+(function () {
+  // Ключи, которые мы считаем «памятью». Только они зеркалятся в БД и
+  // включаются в миграцию — иначе любой сторонний state в localStorage
+  // (которого тут предостаточно: xterm, lucide и т.п.) попадёт в БД.
+  var MEMORY_PREFIXES = ['agent_'];
+  var MEMORY_EXACT = { 'mcp.servers': 1 };
+  // Эти два ключа управляют самим бэкендом — в БД их не пишем, иначе
+  // получим бесконечный цикл при /mem/export.
+  var BACKEND_META_KEYS = { 'agent_mem_backend': 1, 'agent_mem_db_url': 1 };
+
+  function isMemoryKey(k) {
+    if (!k) return false;
+    if (BACKEND_META_KEYS[k]) return false;
+    if (MEMORY_EXACT[k]) return true;
+    for (var i = 0; i < MEMORY_PREFIXES.length; i++) {
+      if (k.indexOf(MEMORY_PREFIXES[i]) === 0) return true;
+    }
+    return false;
+  }
+
+  function trimSlash(u) {
+    if (!u) return '';
+    return String(u).replace(/\/+$/, '');
+  }
+
+  function defaultDbUrl() {
+    // По умолчанию используем тот же URL, что и Workspace API (тот же Flask).
+    var saved = window.localStorage && localStorage.getItem('agent_mem_db_url');
+    if (saved) return trimSlash(saved);
+    var ws = window.localStorage && localStorage.getItem('agent_ws_api_url');
+    if (ws) return trimSlash(ws);
+    var def = (window.AGENT_PRO_DEFAULTS && window.AGENT_PRO_DEFAULTS.wsApiUrl) || '';
+    return trimSlash(def);
+  }
+
+  // ── Оригинальные методы (не трогают наш hook) ─────────────────────────────
+  var origSetItem    = Storage.prototype.setItem;
+  var origRemoveItem = Storage.prototype.removeItem;
+  var origClear      = Storage.prototype.clear;
+
+  function rawSet(k, v)  { origSetItem.call(localStorage, k, v); }
+  function rawDel(k)     { origRemoveItem.call(localStorage, k); }
+  // ── debounce-очередь синхронизации ────────────────────────────────────────
+  var pendingSet = {};
+  var pendingDel = {};
+  var flushTimer = null;
+  var flushDelayMs = 400;
+  var lastSyncOk = null;
+  var lastSyncError = null;
+  var listeners = [];
+
+  function emitChange() {
+    for (var i = 0; i < listeners.length; i++) {
+      try { listeners[i](); } catch (e) {}
+    }
+  }
+
+  function scheduleFlush() {
+    if (flushTimer) clearTimeout(flushTimer);
+    flushTimer = setTimeout(flush, flushDelayMs);
+  }
+
+  function flush() {
+    flushTimer = null;
+    if (Backend.mode !== 'db' || !Backend.dbUrl) return;
+    var sets = pendingSet, dels = Object.keys(pendingDel);
+    if (!Object.keys(sets).length && !dels.length) return;
+    pendingSet = {}; pendingDel = {};
+    var body = JSON.stringify({ set: sets, delete: dels });
+    fetch(trimSlash(Backend.dbUrl) + '/mem/sync', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: body,
+      credentials: 'omit'
+    }).then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    }).then(function () {
+      lastSyncOk = Date.now();
+      lastSyncError = null;
+      emitChange();
+    }).catch(function (e) {
+      lastSyncError = String(e && e.message || e);
+      // Возвращаем в очередь, чтобы повторить при следующем write.
+      Object.keys(sets).forEach(function (k) { if (!(k in pendingSet)) pendingSet[k] = sets[k]; });
+      dels.forEach(function (k) { pendingDel[k] = 1; });
+      emitChange();
+    });
+  }
+
+  // ── Hook setItem/removeItem ───────────────────────────────────────────────
+  Storage.prototype.setItem = function (key, value) {
+    var ret = origSetItem.call(this, key, value);
+    if (this === window.localStorage && Backend.mode === 'db' && isMemoryKey(key)) {
+      pendingSet[key] = value == null ? '' : String(value);
+      delete pendingDel[key];
+      scheduleFlush();
+    }
+    return ret;
+  };
+  Storage.prototype.removeItem = function (key) {
+    var ret = origRemoveItem.call(this, key);
+    if (this === window.localStorage && Backend.mode === 'db' && isMemoryKey(key)) {
+      pendingDel[key] = 1;
+      delete pendingSet[key];
+      scheduleFlush();
+    }
+    return ret;
+  };
+
+  // ── Синхронный pull на старте ─────────────────────────────────────────────
+  // Используем sync XHR намеренно: остальные модули (`ChatManager`,
+  // `SkillsEngine`, `MCPManager`) читают localStorage синхронно, и нам
+  // нужно, чтобы данные в нём уже были к моменту их инициализации.
+  function pullSync(url) {
+    try {
+      var xhr = new XMLHttpRequest();
+      xhr.open('GET', trimSlash(url) + '/mem/export', false);
+      xhr.timeout = 5000;
+      xhr.send(null);
+      if (xhr.status < 200 || xhr.status >= 300) {
+        throw new Error('HTTP ' + xhr.status);
+      }
+      var data = JSON.parse(xhr.responseText);
+      applyExport(data);
+      lastSyncOk = Date.now();
+      lastSyncError = null;
+      return true;
+    } catch (e) {
+      lastSyncError = String(e && e.message || e);
+      console.warn('[MemoryBackend] sync pull failed:', e);
+      return false;
+    }
+  }
+
+  function applyExport(data) {
+    if (!data || typeof data !== 'object') return;
+    var kv = data.kv || {};
+    // Сначала чистим все «memory» ключи в localStorage, потом заливаем из БД.
+    var toRemove = [];
+    for (var i = 0; i < localStorage.length; i++) {
+      var k = localStorage.key(i);
+      if (isMemoryKey(k)) toRemove.push(k);
+    }
+    toRemove.forEach(rawDel);
+    Object.keys(kv).forEach(function (k) {
+      if (isMemoryKey(k)) rawSet(k, kv[k] == null ? '' : String(kv[k]));
+    });
+  }
+
+  // ── Async-операции для UI ────────────────────────────────────────────────
+  function fetchJson(url, opts) {
+    return fetch(url, opts).then(function (r) {
+      if (!r.ok) {
+        return r.text().then(function (t) {
+          throw new Error('HTTP ' + r.status + (t ? ': ' + t : ''));
+        });
+      }
+      return r.json();
+    });
+  }
+
+  function ping() {
+    if (!Backend.dbUrl) return Promise.reject(new Error('URL не задан'));
+    return fetchJson(trimSlash(Backend.dbUrl) + '/mem/health');
+  }
+
+  function pushLocalToDb() {
+    if (!Backend.dbUrl) return Promise.reject(new Error('URL не задан'));
+    var dump = {};
+    for (var i = 0; i < localStorage.length; i++) {
+      var k = localStorage.key(i);
+      if (isMemoryKey(k)) dump[k] = localStorage.getItem(k);
+    }
+    return fetchJson(trimSlash(Backend.dbUrl) + '/mem/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(dump)
+    }).then(function (res) {
+      lastSyncOk = Date.now();
+      lastSyncError = null;
+      emitChange();
+      return res;
+    }, function (e) {
+      lastSyncError = String(e && e.message || e);
+      emitChange();
+      throw e;
+    });
+  }
+
+  function pullDbToLocal() {
+    if (!Backend.dbUrl) return Promise.reject(new Error('URL не задан'));
+    return fetchJson(trimSlash(Backend.dbUrl) + '/mem/export').then(function (data) {
+      applyExport(data);
+      lastSyncOk = Date.now();
+      lastSyncError = null;
+      emitChange();
+      return data;
+    }, function (e) {
+      lastSyncError = String(e && e.message || e);
+      emitChange();
+      throw e;
+    });
+  }
+
+  function clearDb() {
+    if (!Backend.dbUrl) return Promise.reject(new Error('URL не задан'));
+    return fetchJson(trimSlash(Backend.dbUrl) + '/mem/reset', { method: 'POST' });
+  }
+
+  function clearLocal() {
+    var toRemove = [];
+    for (var i = 0; i < localStorage.length; i++) {
+      var k = localStorage.key(i);
+      if (isMemoryKey(k)) toRemove.push(k);
+    }
+    toRemove.forEach(rawDel);
+  }
+
+  // ── Публичный объект ─────────────────────────────────────────────────────
+  var Backend = {
+    mode: (function () {
+      try { return localStorage.getItem('agent_mem_backend') || 'browser'; }
+      catch (e) { return 'browser'; }
+    })(),
+    dbUrl: defaultDbUrl(),
+
+    isMemoryKey: isMemoryKey,
+
+    setMode: function (m) {
+      if (m !== 'browser' && m !== 'db') return;
+      Backend.mode = m;
+      try { localStorage.setItem('agent_mem_backend', m); } catch (e) {}
+      emitChange();
+    },
+    setDbUrl: function (u) {
+      Backend.dbUrl = trimSlash(u);
+      try { localStorage.setItem('agent_mem_db_url', Backend.dbUrl); } catch (e) {}
+      emitChange();
+    },
+    ping: ping,
+    pushLocalToDb: pushLocalToDb,
+    pullDbToLocal: pullDbToLocal,
+    clearDb: clearDb,
+    clearLocal: clearLocal,
+    flushNow: flush,
+    onChange: function (fn) { listeners.push(fn); return function () { listeners = listeners.filter(function (f) { return f !== fn; }); }; },
+    getStatus: function () {
+      return {
+        mode: Backend.mode,
+        dbUrl: Backend.dbUrl,
+        lastSyncOk: lastSyncOk,
+        lastSyncError: lastSyncError,
+        pendingSet: Object.keys(pendingSet).length,
+        pendingDel: Object.keys(pendingDel).length
+      };
+    }
+  };
+
+  // ── Boot ─────────────────────────────────────────────────────────────────
+  // Если режим «db» и URL задан — синхронно тянем дамп из БД, чтобы все
+  // последующие модули (ChatManager и т.д.) увидели данные сразу.
+  if (Backend.mode === 'db' && Backend.dbUrl) {
+    pullSync(Backend.dbUrl);
+  }
+
+  // Перед закрытием вкладки — синхронно сливаем pending-изменения через
+  // sendBeacon, чтобы не потерять последние правки.
+  window.addEventListener('beforeunload', function () {
+    if (Backend.mode !== 'db' || !Backend.dbUrl) return;
+    var sets = pendingSet, dels = Object.keys(pendingDel);
+    if (!Object.keys(sets).length && !dels.length) return;
+    var body = JSON.stringify({ set: sets, delete: dels });
+    if (navigator.sendBeacon) {
+      try {
+        navigator.sendBeacon(
+          trimSlash(Backend.dbUrl) + '/mem/sync',
+          new Blob([body], { type: 'application/json' })
+        );
+      } catch (e) {}
+    }
+  });
+
+  window.MemoryBackend = Backend;
+})();
+</script>
+
 <script src="https://unpkg.com/lucide@latest"></script>
 <script src="https://js.puter.com/v2/"></script>
 <link rel="stylesheet" href="https://unpkg.com/xterm@5.3.0/css/xterm.css"/>
@@ -4865,6 +5167,90 @@ button:disabled, .icon-btn:disabled, input:disabled, textarea:disabled {
 
         </div>
       </div><!-- /settings-card Workspace -->
+
+      <!-- ══ ПАМЯТЬ ══ -->
+      <div class="settings-card" id="memSettingsCard">
+        <button class="settings-card-header" onclick="toggleSettingsCard(this)">
+          <i data-lucide="brain-circuit" class="settings-card-header-icon"></i>
+          <span class="settings-card-header-label">Память</span>
+          <span id="memHeaderBadge" style="margin-left:auto;margin-right:8px;font-size:10px;color:var(--text-2);font-weight:500;"></span>
+          <i data-lucide="chevron-down" class="settings-card-chevron"></i>
+        </button>
+        <div class="settings-card-body">
+
+          <!-- Выбор бэкенда -->
+          <div class="ws-mode-seg" id="memModeSeg">
+            <button class="ws-mode-seg-btn" id="memModeBtnBrowser" onclick="MemorySettings.selectMode('browser')">
+              <i data-lucide="database"></i> Браузер (localStorage)
+            </button>
+            <button class="ws-mode-seg-btn" id="memModeBtnDb" onclick="MemorySettings.selectMode('db')">
+              <i data-lucide="server"></i> Сервер (БД)
+            </button>
+          </div>
+
+          <!-- ─── Панель Browser ─── -->
+          <div class="ws-backend-panel" id="memPanelBrowser" style="display:none;">
+            <div class="settings-hint">
+              Чаты, скилы, MCP-серверы и все настройки хранятся в <b>localStorage</b> вашего браузера.
+              Это работает офлайн и без какой-либо настройки, но данные исчезают вместе с очисткой
+              браузера и не синхронизируются между устройствами.
+            </div>
+            <div class="settings-actions" style="margin-top:8px;">
+              <button id="memBrowserExportBtn" class="input-modern" style="cursor:pointer;display:flex;align-items:center;gap:6px;padding:7px 12px;">
+                <i data-lucide="download" style="width:13px;height:13px;"></i> Скачать дамп
+              </button>
+              <span id="memBrowserStatus" class="status-text-small"></span>
+            </div>
+          </div>
+
+          <!-- ─── Панель DB ─── -->
+          <div class="ws-backend-panel" id="memPanelDb" style="display:none;">
+            <div class="setting-row">
+              <label>URL сервера</label>
+              <input id="memDbUrl" type="text" class="input-modern" placeholder="http://localhost:8764" />
+            </div>
+            <div class="settings-actions">
+              <button id="memDbConnectBtn" class="btn-primary">
+                <i data-lucide="zap"></i> Подключить
+              </button>
+              <span id="memDbStatus" class="status-text-small"></span>
+            </div>
+
+            <div class="settings-hint" id="memDbHint" style="margin-top:8px;">
+              Те же чаты/скилы/настройки автоматически дублируются в SQLite на сервере
+              (по умолчанию <code>~/.local/share/agent-pro/memory.db</code>). При запуске страницы
+              данные подтягиваются из БД, поэтому их видно на любом устройстве, где открыт тот же
+              сервер. Бэкенд — те же эндпоинты <code>/mem/*</code> в <code>wsapi_server.py</code>.
+            </div>
+
+            <div style="margin-top:12px;border-top:1px solid var(--border-1);padding-top:10px;">
+              <div style="font-size:11px;font-weight:600;color:var(--text-1);margin-bottom:8px;">Миграция</div>
+              <div class="settings-actions" style="flex-wrap:wrap;">
+                <button id="memMigrateUpBtn" class="btn-primary" style="display:flex;align-items:center;gap:6px;">
+                  <i data-lucide="upload-cloud" style="width:13px;height:13px;"></i>
+                  Импортировать в БД
+                </button>
+                <button id="memMigrateDownBtn" class="input-modern" style="cursor:pointer;display:flex;align-items:center;gap:6px;padding:7px 12px;">
+                  <i data-lucide="download-cloud" style="width:13px;height:13px;"></i>
+                  Восстановить в браузер
+                </button>
+                <button id="memDbResetBtn" class="btn-danger" style="display:flex;align-items:center;gap:6px;">
+                  <i data-lucide="trash-2" style="width:13px;height:13px;"></i>
+                  Очистить БД
+                </button>
+                <span id="memMigrateStatus" class="status-text-small"></span>
+              </div>
+              <div class="settings-hint" style="margin-top:6px;">
+                «Импортировать» — снять снэпшот всей памяти из браузера и залить в БД (заменит её содержимое).
+                «Восстановить» — обратное: перезаписать localStorage из БД (потребуется перезагрузить страницу).
+              </div>
+            </div>
+
+            <div id="memDbCounts" style="margin-top:10px;font-size:11px;color:var(--text-2);"></div>
+          </div>
+
+        </div>
+      </div><!-- /settings-card Memory -->
 
       <!-- ══ MCP-СЕРВЕРЫ ══ -->
       <div class="settings-card">
@@ -12657,6 +13043,7 @@ async function _uploadFileToWorkspace(file, content, encoding) {
   }
   // Init workspace backend UI
   if (typeof WsBackend !== 'undefined') WsBackend.init();
+  if (typeof MemorySettings !== 'undefined') MemorySettings.init();
   // Sync workspace badges/inputs with the actual VFS state (path, etc.)
   if (typeof syncWorkspaceUI === 'function') syncWorkspaceUI();
   await refreshFilesPanel();
@@ -15005,6 +15392,161 @@ const WsBackend = (() => {
   }
 
   return { selectMode, updateOpfsInfo, init };
+})();
+
+/* ========= MEMORY BACKEND SETTINGS UI ========= */
+const MemorySettings = (() => {
+  function _setMsg(elId, text, kind) {
+    const el = document.getElementById(elId);
+    if (!el) return;
+    el.textContent = text || '';
+    el.style.color = kind === 'error' ? 'var(--danger)' :
+                     kind === 'ok'    ? 'var(--success)' :
+                     kind === 'warn'  ? 'var(--warning, #c08a3e)' : 'var(--text-2)';
+  }
+
+  function selectMode(mode) {
+    if (mode !== 'browser' && mode !== 'db') return;
+    const panelB = document.getElementById('memPanelBrowser');
+    const panelD = document.getElementById('memPanelDb');
+    const btnB   = document.getElementById('memModeBtnBrowser');
+    const btnD   = document.getElementById('memModeBtnDb');
+    if (!panelB || !panelD) return;
+    panelB.style.display = mode === 'browser' ? '' : 'none';
+    panelD.style.display = mode === 'db'      ? '' : 'none';
+    btnB.classList.toggle('active', mode === 'browser');
+    btnD.classList.toggle('active', mode === 'db');
+    if (window.MemoryBackend) window.MemoryBackend.setMode(mode);
+    _renderHeader();
+    if (mode === 'db') _refreshHealth();
+    if (window.lucide) window.lucide.createIcons();
+  }
+
+  function _renderHeader() {
+    const b = document.getElementById('memHeaderBadge');
+    if (!b || !window.MemoryBackend) return;
+    b.textContent = window.MemoryBackend.mode === 'db' ? 'БД' : 'Браузер';
+  }
+
+  function _renderCounts(h) {
+    const el = document.getElementById('memDbCounts');
+    if (!el) return;
+    if (!h || !h.ok) { el.textContent = ''; return; }
+    const c = h.counts || {};
+    const fmtSize = b => !b ? '0 Б' : b < 1024 ? b + ' Б' : b < 1048576 ? (b/1024).toFixed(1) + ' КБ' : (b/1048576).toFixed(1) + ' МБ';
+    el.innerHTML =
+      '<b>В БД сейчас:</b> ' +
+      (c.chats || 0) + ' чат(ов), ' +
+      (c.messages || 0) + ' сообщ., ' +
+      (c.skills || 0) + ' скил(ов), ' +
+      (c.mcp_servers || 0) + ' MCP, ' +
+      (c.kv || 0) + ' настроек · файл ' + fmtSize(h.size_bytes || 0) +
+      (h.path ? ' <span style="opacity:.6;">(' + escHtmlSafe(h.path) + ')</span>' : '');
+  }
+
+  function escHtmlSafe(s) {
+    return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  function _refreshHealth() {
+    if (!window.MemoryBackend) return Promise.resolve();
+    return window.MemoryBackend.ping().then(h => {
+      _setMsg('memDbStatus', '✓ Подключено', 'ok');
+      _renderCounts(h);
+      return h;
+    }, e => {
+      _setMsg('memDbStatus', '✗ ' + (e && e.message || e), 'error');
+      _renderCounts(null);
+    });
+  }
+
+  function _wireButtons() {
+    const urlInput = document.getElementById('memDbUrl');
+    if (urlInput && window.MemoryBackend) {
+      urlInput.value = window.MemoryBackend.dbUrl || '';
+      urlInput.addEventListener('change', () => {
+        window.MemoryBackend.setDbUrl(urlInput.value.trim());
+      });
+    }
+
+    const connectBtn = document.getElementById('memDbConnectBtn');
+    if (connectBtn) connectBtn.addEventListener('click', () => {
+      if (urlInput) window.MemoryBackend.setDbUrl(urlInput.value.trim());
+      _setMsg('memDbStatus', 'Подключаю…');
+      _refreshHealth();
+    });
+
+    const upBtn = document.getElementById('memMigrateUpBtn');
+    if (upBtn) upBtn.addEventListener('click', () => {
+      if (!confirm('Импортировать всю память из браузера в БД? Содержимое БД будет полностью заменено.')) return;
+      _setMsg('memMigrateStatus', 'Загружаю в БД…');
+      window.MemoryBackend.pushLocalToDb().then(res => {
+        _setMsg('memMigrateStatus', '✓ Импорт завершён', 'ok');
+        _renderCounts(res);
+      }, e => {
+        _setMsg('memMigrateStatus', '✗ ' + (e && e.message || e), 'error');
+      });
+    });
+
+    const downBtn = document.getElementById('memMigrateDownBtn');
+    if (downBtn) downBtn.addEventListener('click', () => {
+      if (!confirm('Восстановить всю память из БД в браузер? Текущие данные в localStorage будут перезаписаны (страница перезагрузится).')) return;
+      _setMsg('memMigrateStatus', 'Тяну из БД…');
+      window.MemoryBackend.pullDbToLocal().then(() => {
+        _setMsg('memMigrateStatus', '✓ Восстановлено, перезагружаю…', 'ok');
+        setTimeout(() => location.reload(), 600);
+      }, e => {
+        _setMsg('memMigrateStatus', '✗ ' + (e && e.message || e), 'error');
+      });
+    });
+
+    const resetBtn = document.getElementById('memDbResetBtn');
+    if (resetBtn) resetBtn.addEventListener('click', () => {
+      if (!confirm('Удалить ВСЕ данные из серверной БД памяти? Это нельзя отменить.')) return;
+      _setMsg('memMigrateStatus', 'Очищаю…');
+      window.MemoryBackend.clearDb().then(res => {
+        _setMsg('memMigrateStatus', '✓ БД очищена', 'ok');
+        _renderCounts(res);
+      }, e => {
+        _setMsg('memMigrateStatus', '✗ ' + (e && e.message || e), 'error');
+      });
+    });
+
+    const exportBtn = document.getElementById('memBrowserExportBtn');
+    if (exportBtn) exportBtn.addEventListener('click', () => {
+      const dump = {};
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (window.MemoryBackend && window.MemoryBackend.isMemoryKey(k)) {
+          dump[k] = localStorage.getItem(k);
+        }
+      }
+      const blob = new Blob([JSON.stringify(dump, null, 2)], { type: 'application/json' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'agent-pro-memory-' + new Date().toISOString().replace(/[:.]/g,'-') + '.json';
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+      _setMsg('memBrowserStatus', '✓ Скачано (' + Object.keys(dump).length + ' ключ(ей))', 'ok');
+    });
+  }
+
+  function init() {
+    if (!window.MemoryBackend) return;
+    _wireButtons();
+    selectMode(window.MemoryBackend.mode || 'browser');
+    if (window.MemoryBackend.mode === 'db') _refreshHealth();
+    window.MemoryBackend.onChange(() => {
+      const st = window.MemoryBackend.getStatus();
+      if (st.lastSyncError) {
+        _setMsg('memDbStatus', '⚠ ' + st.lastSyncError, 'warn');
+      } else if (st.lastSyncOk) {
+        _setMsg('memDbStatus', '✓ Подключено · последняя синхронизация ' + new Date(st.lastSyncOk).toLocaleTimeString(), 'ok');
+      }
+    });
+  }
+
+  return { selectMode, init };
 })();
 
 /* ========= SKILLS ENGINE ========= */

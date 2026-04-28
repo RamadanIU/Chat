@@ -1,6 +1,6 @@
-"""Workspace API — простой HTTP-сервер для файловой системы агента.
+"""Workspace API — простой HTTP-сервер для файловой системы агента + памяти.
 
-Endpoints:
+Endpoints (workspace):
     GET  /ws/ping                          — healthcheck
     GET  /ws/config                        — текущая рабочая область + список разрешённых корней
     POST /ws/config   {workspace_dir}      — сменить рабочую область на лету
@@ -17,6 +17,27 @@ Endpoints:
     GET  /ws/search?query=&...             — поиск по содержимому файлов
     POST /ws/reset                         — очистить рабочую область
 
+Endpoints (memory — БД-бэкенд для всего, что раньше жило в localStorage):
+    GET  /mem/health                       — статус БД, счётчики
+    GET  /mem/export                       — полный снэпшот (kv + чаты + скилы + MCP)
+    POST /mem/import   {…}                 — атомарно заменить содержимое БД
+                                              (формат: localStorage shape ИЛИ /mem/export shape)
+    POST /mem/sync     {set, delete}       — инкрементальные апдейты по ключам
+    POST /mem/reset                        — полная очистка БД памяти
+    GET  /mem/kv?key=                      — конкретный ключ или весь дамп kv
+    POST /mem/kv       {key, value}        — выставить ключ (value=null → удалить)
+    DELETE /mem/kv?key=                    — удалить ключ
+    GET  /mem/chats                        — список чатов с сообщениями
+    GET  /mem/chats/<id>                   — конкретный чат
+    POST /mem/chats    {id, name, …}       — upsert чата (вместе с messages)
+    DELETE /mem/chats/<id>                 — удалить чат
+    GET  /mem/skills                       — все скилы
+    POST /mem/skills   {skills:[…]}        — полная замена набора скилов
+    DELETE /mem/skills/<id>                — удалить скил
+    GET  /mem/mcp/servers                  — все MCP-серверы
+    POST /mem/mcp/servers {servers:[…]}    — полная замена набора серверов
+    DELETE /mem/mcp/servers/<id>           — удалить сервер
+
 Конфигурация (env):
     WORKSPACE_DIR       начальная рабочая область (default: ~/storage/shared/workspace,
                         fallback ~/workspace, если первой не существует)
@@ -26,6 +47,7 @@ Endpoints:
                         одного из этих корней.
     WORKSPACE_HOST      адрес для прослушивания (default: 0.0.0.0)
     WORKSPACE_PORT      порт (default: 8764)
+    AGENT_PRO_MEMORY_DB путь к SQLite-файлу памяти (default: ~/.local/share/agent-pro/memory.db)
 """
 
 from __future__ import annotations
@@ -40,8 +62,20 @@ from typing import Iterable
 from flask import Flask, abort, jsonify, request
 from flask_cors import CORS
 
+from memory_db import MemoryDB
+
 app = Flask(__name__)
 CORS(app)
+
+# Глобальная БД памяти. Создаём лениво, чтобы тесты могли подменять путь.
+_memory_db: MemoryDB | None = None
+
+
+def memory_db() -> MemoryDB:
+    global _memory_db
+    if _memory_db is None:
+        _memory_db = MemoryDB()
+    return _memory_db
 
 
 # ═══════════════════════ КОНФИГУРАЦИЯ ═══════════════════════
@@ -490,6 +524,164 @@ def reset():
     return jsonify({"ok": True})
 
 
+# ═══════════════════════ /mem/* — память (БД-бэкенд для localStorage) ═══════
+#
+# Сюда переезжают чаты/скилы/MCP/настройки, которые раньше жили только в
+# браузерном localStorage. Подробности — в memory_db.py.
+
+@app.route("/mem/health")
+def mem_health():
+    try:
+        return jsonify(memory_db().health())
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/mem/export")
+def mem_export():
+    return jsonify(memory_db().export_all())
+
+
+@app.route("/mem/import", methods=["POST"])
+def mem_import():
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        abort(400, description="Ожидался JSON-объект (localStorage shape или /mem/export shape)")
+    try:
+        return jsonify({"ok": True, **memory_db().import_all(payload)})
+    except ValueError as e:
+        abort(400, description=str(e))
+
+
+@app.route("/mem/sync", methods=["POST"])
+def mem_sync():
+    """Инкрементальный апдейт: `{set: {key:value}, delete: [keys]}`."""
+    payload = request.get_json(silent=True) or {}
+    sets = payload.get("set") if isinstance(payload.get("set"), dict) else {}
+    deletes = payload.get("delete") if isinstance(payload.get("delete"), list) else []
+    return jsonify(memory_db().sync(sets, deletes))
+
+
+@app.route("/mem/reset", methods=["POST"])
+def mem_reset():
+    memory_db().reset()
+    return jsonify({"ok": True, **memory_db().health()})
+
+
+# ── kv ──
+
+@app.route("/mem/kv", methods=["GET"])
+def mem_kv_get():
+    key = request.args.get("key", "")
+    if not key:
+        return jsonify(memory_db().kv_all())
+    val = memory_db().kv_get(key)
+    return jsonify({"key": key, "value": val})
+
+
+@app.route("/mem/kv", methods=["POST"])
+def mem_kv_set():
+    payload = request.get_json(silent=True) or {}
+    key = (payload.get("key") or "").strip()
+    if not key:
+        abort(400, description="key обязателен")
+    value = payload.get("value")
+    if value is None:
+        memory_db().kv_delete(key)
+        return jsonify({"ok": True, "deleted": True, "key": key})
+    memory_db().kv_set(key, str(value))
+    return jsonify({"ok": True, "key": key})
+
+
+@app.route("/mem/kv", methods=["DELETE"])
+def mem_kv_delete():
+    key = request.args.get("key", "")
+    if not key:
+        abort(400, description="key обязателен")
+    deleted = memory_db().kv_delete(key)
+    return jsonify({"ok": True, "deleted": deleted, "key": key})
+
+
+# ── chats ──
+
+@app.route("/mem/chats", methods=["GET"])
+def mem_chats_list():
+    return jsonify({"chats": memory_db().chats_list()})
+
+
+@app.route("/mem/chats/<chat_id>", methods=["GET"])
+def mem_chat_get(chat_id: str):
+    chat = memory_db().chats_get(chat_id)
+    if not chat:
+        abort(404, description="Чат не найден")
+    return jsonify(chat)
+
+
+@app.route("/mem/chats", methods=["POST"])
+def mem_chat_upsert():
+    payload = request.get_json(silent=True) or {}
+    if not payload.get("id"):
+        abort(400, description="id обязателен")
+    return jsonify(memory_db().chats_upsert(payload))
+
+
+@app.route("/mem/chats/<chat_id>", methods=["DELETE"])
+def mem_chat_delete(chat_id: str):
+    deleted = memory_db().chats_delete(chat_id)
+    return jsonify({"ok": True, "deleted": deleted, "id": chat_id})
+
+
+# ── skills ──
+
+@app.route("/mem/skills", methods=["GET"])
+def mem_skills_list():
+    return jsonify({"skills": memory_db().skills_list()})
+
+
+@app.route("/mem/skills", methods=["POST"])
+def mem_skills_replace():
+    """Полная замена набора скилов."""
+    payload = request.get_json(silent=True) or {}
+    skills = payload.get("skills") if isinstance(payload, dict) else None
+    if skills is None and isinstance(payload, list):
+        skills = payload
+    if not isinstance(skills, list):
+        abort(400, description="Ожидался массив `skills` (или массив верхнего уровня)")
+    memory_db().skills_replace_all(skills)
+    return jsonify({"ok": True, "skills": memory_db().skills_list()})
+
+
+@app.route("/mem/skills/<skill_id>", methods=["DELETE"])
+def mem_skill_delete(skill_id: str):
+    deleted = memory_db().skills_delete(skill_id)
+    return jsonify({"ok": True, "deleted": deleted, "id": skill_id})
+
+
+# ── mcp_servers ──
+
+@app.route("/mem/mcp/servers", methods=["GET"])
+def mem_mcp_list():
+    return jsonify({"servers": memory_db().mcp_list()})
+
+
+@app.route("/mem/mcp/servers", methods=["POST"])
+def mem_mcp_replace():
+    payload = request.get_json(silent=True) or {}
+    servers = payload.get("servers") if isinstance(payload, dict) else None
+    if servers is None and isinstance(payload, list):
+        servers = payload
+    if not isinstance(servers, list):
+        abort(400, description="Ожидался массив `servers` (или массив верхнего уровня)")
+    memory_db().mcp_replace_all(servers)
+    return jsonify({"ok": True, "servers": memory_db().mcp_list()})
+
+
+@app.route("/mem/mcp/servers/<server_id>", methods=["DELETE"])
+def mem_mcp_delete(server_id: str):
+    deleted = memory_db().mcp_delete(server_id)
+    return jsonify({"ok": True, "deleted": deleted, "id": server_id})
+
+
 # ═══════════════════════ entrypoint ═══════════════════════
 
 def main() -> None:
@@ -510,6 +702,11 @@ def main() -> None:
     print(f"● Workspace API запущен на http://{args.host}:{args.port}")
     print(f"  Рабочая область : {BASE_DIR}")
     print(f"  Разрешённые корни: {ALLOWED_ROOTS}")
+    try:
+        mem_path = memory_db().path
+        print(f"  БД памяти       : {mem_path}")
+    except Exception as e:
+        print(f"  БД памяти       : недоступна ({e})")
     app.run(host=args.host, port=args.port, debug=False)
 
 
