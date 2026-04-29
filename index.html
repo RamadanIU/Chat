@@ -11870,7 +11870,8 @@ async function runSubAgent(task, context = '', stepTitle = 'Sub-task', uiElement
         msg = await callSubAgentModel(apiMessages, subToolDefs);
       } catch (e) {
         if (e.name === 'AbortError') throw e;
-        subLog.push({ icon: 'x-circle', text: `Ошибка модели: ${e.message}` });
+        // В UI суб-агента — только короткий маркер. Полный текст ошибки уходит в LLM.
+        subLog.push({ icon: 'alert-triangle', text: 'ошибка выполнения' });
         updateUI(subLog, `шаг ${step + 1}...`, 'working');
         subMessages.push({
           role: 'user',
@@ -11929,7 +11930,8 @@ async function runSubAgent(task, context = '', stepTitle = 'Sub-task', uiElement
             }
           } catch (e) {
             result = { error: String(e.message || e) };
-            subLog.push({ icon: 'x-circle', text: `Ошибка ${name}: ${e.message}` });
+            // Сообщение об ошибке инструмента уходит в LLM как tool-result; в UI — только маркер.
+            subLog.push({ icon: 'alert-triangle', text: 'ошибка выполнения' });
           }
           subMessages.push({ role: 'tool', tool_call_id: call.id, name, content: JSON.stringify(result) });
         }
@@ -11975,7 +11977,8 @@ async function runSubAgent(task, context = '', stepTitle = 'Sub-task', uiElement
     return { report, steps: step, actions: subLog };
 
   } catch (e) {
-    subLog.push({ icon: 'alert-circle', text: `Ошибка: ${e.message}` });
+    // UI — только маркер; полный текст ошибки уходит в report (родительская LLM сама разбирается).
+    subLog.push({ icon: 'alert-triangle', text: 'ошибка выполнения' });
     updateUI(subLog, 'ошибка', 'error');
     return { report: `Ошибка суб-агента: ${e.message}`, steps: step, actions: subLog, error: e.message };
   }
@@ -12168,6 +12171,18 @@ function addToolAction(text, preText) {
   chat.messages.push({ role: 'assistant', content: text, isToolAction: true });
   ChatManager.updateMessages(chat.messages);
   renderToolAction(text, preText);
+}
+// Компактный UI-индикатор «ошибка выполнения». Только значок + короткий
+// текст; деталей пользователь не видит. Помечается isToolAction, чтобы при
+// reload чата не уходило в API-историю (LLM получает полный текст ошибки
+// отдельным system-сообщением, см. runAgent).
+function addErrorAction(label) {
+  const chat = ChatManager.getActive();
+  if (!chat) return;
+  const text = '<i data-lucide="alert-triangle" style="width:11px;height:11px;display:inline-block;vertical-align:middle;margin-right:5px;opacity:0.75;color:var(--warn,#e0a800);flex-shrink:0;"></i>' + (label || 'ошибка выполнения');
+  chat.messages.push({ role: 'assistant', content: text, isToolAction: true });
+  ChatManager.updateMessages(chat.messages);
+  renderToolAction(text);
 }
 function addWaitingMessage(text) {
   const chat = ChatManager.getActive();
@@ -12597,7 +12612,11 @@ async function runAgent(userText) {
   // ═══════════════════════════════════════════════════════════════════════════
   const MAX_STEPS = 80;
   const MAX_CONSECUTIVE_NO_TOOL = 3;
-  const MAX_CONSECUTIVE_ERRORS = 3;
+  // Жёсткий лимит, чтобы при полностью неработающем провайдере не крутить
+  // бесконечно. Поднят высоко: пользователь видит только компактный значок
+  // «ошибка выполнения», подробный текст уходит в LLM, и она сама решает
+  // что делать. Останавливаемся только при экстремальной серии ошибок подряд.
+  const MAX_CONSECUTIVE_ERRORS = 10;
   let step = 0;
   let consecutiveNoTool = 0;
   let consecutiveErrors = 0;
@@ -12635,9 +12654,12 @@ async function runAgent(userText) {
         consecutiveErrors++;
         const errMsg = String(e.message || e);
         console.error('[AGENT] callModel error:', e);
-        addMsg('system', '⚠️ Ошибка модели: ' + errMsg + (consecutiveErrors < MAX_CONSECUTIVE_ERRORS ? ' — пробую продолжить...' : ''));
+        // Пользователю — только компактный значок. Полный текст ошибки
+        // уходит в историю как system-message: LLM видит детали и сама решает,
+        // как поступить (повторить, поменять стратегию, вызвать finish_task).
+        addErrorAction();
         if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
-          addMsg('system', `⛔ ${MAX_CONSECUTIVE_ERRORS} ошибки подряд. Останавливаю автопродолжение — напишите «продолжи», чтобы попробовать снова.`);
+          setStatus('Ошибка', 'error');
           break;
         }
         chat.messages.push({
@@ -12850,8 +12872,9 @@ document.getElementById('send').addEventListener('click', async () => {
     await runAgent(text);
   } catch (e) {
     console.error('[ERROR]', e);
-    addMsg('system', 'Ошибка: ' + String(e.message || e));
-    setStatus('Ошибка: ' + e.message, 'error');
+    // В UI — только компактный значок. Подробный текст пишется в консоль.
+    addErrorAction();
+    setStatus('Ошибка', 'error');
   }
 });
 document.getElementById('prompt').addEventListener('keydown', (e) => {
