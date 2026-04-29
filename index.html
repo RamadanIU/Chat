@@ -5321,6 +5321,47 @@ button:disabled, .icon-btn:disabled, input:disabled, textarea:disabled {
         </div>
       </div><!-- /settings-card MCP -->
 
+      <!-- ══ ОБНОВЛЕНИЯ (Self-update) ══ -->
+      <div class="settings-card" id="updatesSettingsCard">
+        <button class="settings-card-header" onclick="toggleSettingsCard(this)">
+          <i data-lucide="download-cloud" class="settings-card-header-icon"></i>
+          <span class="settings-card-header-label">Обновления</span>
+          <span id="updatesHeaderBadge" style="margin-left:auto;margin-right:8px;font-size:10px;color:var(--text-2);font-weight:500;"></span>
+          <i data-lucide="chevron-down" class="settings-card-chevron"></i>
+        </button>
+        <div class="settings-card-body">
+
+          <div id="updatesVersionInfo" style="font-size:11px;color:var(--text-2);padding:8px;background:var(--bg-2);border:1px solid var(--border-1);border-radius:var(--r-sm);line-height:1.6;">
+            <div>Версия: <span id="updatesCurrentVersion" style="color:var(--text-1);">…</span></div>
+            <div>Последний коммит: <span id="updatesCurrentCommit" style="color:var(--text-1);">…</span></div>
+            <div>Origin: <span id="updatesOriginUrl" style="color:var(--text-1);">…</span></div>
+          </div>
+
+          <div class="settings-actions" style="margin-top:8px;">
+            <button id="updatesCheckBtn" class="btn-primary" style="flex:1;">
+              <i data-lucide="refresh-cw"></i> Проверить и обновить
+            </button>
+            <span id="updatesStatus" class="status-text-small"></span>
+          </div>
+
+          <div id="updatesPanel" style="display:none;margin-top:8px;font-size:11px;color:var(--text-2);background:var(--bg-2);border:1px solid var(--border-1);border-radius:var(--r-sm);padding:8px;line-height:1.5;"></div>
+
+          <details id="updatesLogWrap" style="margin-top:8px;display:none;">
+            <summary style="cursor:pointer;font-size:11px;color:var(--text-2);font-weight:600;padding:6px 0;user-select:none;">Лог установки</summary>
+            <div id="updatesLog" style="max-height:240px;overflow-y:auto;background:var(--code-bg);border:1px solid var(--border-1);border-radius:var(--r-sm);padding:8px;font-family:var(--font-mono);font-size:10px;line-height:1.5;color:var(--text-1);margin-top:6px;white-space:pre-wrap;"></div>
+          </details>
+
+          <div class="settings-hint" style="margin-top:8px;">
+            Делает <code>git fetch</code> и, если есть новые коммиты, выполняет
+            <code>git pull --ff-only</code> в каталоге установки. После успешного
+            обновления перезапустите стек: <code>bash start.sh restart</code>.
+            Требует, чтобы каталог установки был git-репозиторием и не содержал
+            незакоммиченных изменений.
+          </div>
+
+        </div>
+      </div><!-- /settings-card Обновления -->
+
     </div><!-- /settings-container -->
 
     <!-- Постоянный футер с кнопкой сохранения -->
@@ -15321,6 +15362,214 @@ document.getElementById('wsApiWorkspaceApplyBtn')?.addEventListener('click', asy
     statusEl.textContent = '✗ ' + r.error; statusEl.style.color = 'var(--error)';
   }
 });
+
+/* ========= ОБНОВЛЕНИЯ — карточка Settings ========= */
+(function () {
+  const DEFAULTS = window.AGENT_PRO_DEFAULTS || {};
+
+  function apiBase() {
+    const fromInput = (document.getElementById('wsApiUrl')?.value || '').trim().replace(/\/+$/, '');
+    if (fromInput) return fromInput;
+    const fromStorage = (localStorage.getItem('agent_ws_api_url') || '').trim().replace(/\/+$/, '');
+    if (fromStorage) return fromStorage;
+    return (DEFAULTS.wsApiUrl || '').replace(/\/+$/, '');
+  }
+
+  function authHeader() {
+    const auth = (document.getElementById('wsApiAuth')?.value || localStorage.getItem('agent_ws_api_auth') || '').trim();
+    if (!auth) return {};
+    return { Authorization: auth.startsWith('Basic ') || auth.startsWith('Bearer ') ? auth : 'Basic ' + btoa(auth) };
+  }
+
+  async function call(method, path, body) {
+    const base = apiBase();
+    if (!base) throw new Error('Не указан URL Workspace API');
+    const opts = { method, headers: { 'Accept': 'application/json', ...authHeader() } };
+    if (body !== undefined) {
+      opts.headers['Content-Type'] = 'application/json';
+      opts.body = JSON.stringify(body);
+    }
+    const r = await fetch(base + path, opts);
+    let data = null;
+    try { data = await r.json(); } catch (_) {}
+    if (!r.ok) {
+      const msg = (data && (data.error || data.description)) || ('HTTP ' + r.status);
+      const err = new Error(msg);
+      err.status = r.status;
+      err.data = data;
+      throw err;
+    }
+    return data || {};
+  }
+
+  function fmtCommit(c) {
+    if (!c) return '—';
+    const date = c.date ? new Date(c.date).toLocaleString() : '';
+    return `${c.short_sha || ''} · ${c.subject || ''}${date ? ' · ' + date : ''}`;
+  }
+
+  function setStatus(text, color) {
+    const el = document.getElementById('updatesStatus');
+    if (!el) return;
+    el.textContent = text || '';
+    el.style.color = color || 'var(--text-2)';
+  }
+
+  function setBadge(text, color) {
+    const el = document.getElementById('updatesHeaderBadge');
+    if (!el) return;
+    el.textContent = text || '';
+    el.style.color = color || 'var(--text-2)';
+  }
+
+  function showPanel(html, color) {
+    const el = document.getElementById('updatesPanel');
+    if (!el) return;
+    if (!html) { el.style.display = 'none'; el.innerHTML = ''; return; }
+    el.style.display = 'block';
+    el.style.color = color || 'var(--text-2)';
+    el.innerHTML = html;
+  }
+
+  function appendLog(logs) {
+    if (!logs || !logs.length) return;
+    const wrap = document.getElementById('updatesLogWrap');
+    const out = document.getElementById('updatesLog');
+    if (!wrap || !out) return;
+    wrap.style.display = 'block';
+    const chunks = logs.map(l => {
+      const head = `$ ${l.cmd}\n[exit ${l.code}]`;
+      const so = (l.stdout || '').trimEnd();
+      const se = (l.stderr || '').trimEnd();
+      return [head, so, se && '— stderr —\n' + se].filter(Boolean).join('\n');
+    });
+    out.textContent = chunks.join('\n\n');
+  }
+
+  function escapeHtml(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, ch => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+    })[ch]);
+  }
+
+  async function refreshVersionInfo() {
+    const verEl = document.getElementById('updatesCurrentVersion');
+    const commitEl = document.getElementById('updatesCurrentCommit');
+    const originEl = document.getElementById('updatesOriginUrl');
+    if (!verEl) return;
+    try {
+      const v = await call('GET', '/sys/version');
+      if (v.is_git === false) {
+        verEl.textContent = '— (не git-репозиторий)';
+        commitEl.textContent = v.install_dir || '';
+        originEl.textContent = '';
+        setBadge('недоступно', 'var(--warning)');
+        return;
+      }
+      verEl.textContent = `${v.branch || '?'} · ${v.short_sha || ''}${v.dirty ? ' (dirty)' : ''}`;
+      commitEl.textContent = fmtCommit(v.last_commit);
+      originEl.textContent = v.origin_url || '';
+      setBadge('', '');
+    } catch (e) {
+      verEl.textContent = 'недоступно';
+      commitEl.textContent = '';
+      originEl.textContent = '';
+      setBadge('нет связи', 'var(--error)');
+    }
+  }
+
+  async function checkAndUpdate() {
+    const btn = document.getElementById('updatesCheckBtn');
+    if (!btn) return;
+    btn.disabled = true;
+    showPanel('');
+    setStatus('⏳ Проверка...', 'var(--text-2)');
+    try {
+      const check = await call('GET', '/sys/update/check');
+      if (!check.ok) {
+        setStatus('✗ ' + (check.error || 'не удалось проверить'), 'var(--error)');
+        showPanel(escapeHtml(check.error || ''), 'var(--error)');
+        return;
+      }
+      if (!check.update_available) {
+        setStatus('✓ Актуальная версия', 'var(--success)');
+        const ahead = check.ahead || 0;
+        showPanel(
+          `Локальная и удалённая ветка совпадают (${escapeHtml(check.remote_branch || '')}).` +
+          (ahead ? ` Локально впереди на <b>${ahead}</b> коммит(ов).` : ''),
+          'var(--text-2)',
+        );
+        await refreshVersionInfo();
+        return;
+      }
+
+      // Есть обновление — применяем сразу.
+      const list = (check.incoming_commits || []).slice(0, 10).map(c =>
+        `<div style="margin-top:4px;"><code>${escapeHtml(c.short_sha)}</code> ${escapeHtml(c.subject || '')}</div>`
+      ).join('');
+      showPanel(
+        `Найдено <b>${check.behind}</b> новых коммит(ов). Применяю…` + list,
+        'var(--text-2)',
+      );
+      setStatus('⏳ Установка...', 'var(--text-2)');
+
+      const apply = await call('POST', '/sys/update/apply', { install_deps: true });
+      appendLog(apply.logs);
+      if (!apply.ok) {
+        setStatus('✗ ' + (apply.error || 'обновление не применено'), 'var(--error)');
+        showPanel(escapeHtml(apply.error || 'Ошибка применения обновления'), 'var(--error)');
+        return;
+      }
+
+      const applied = apply.applied_commits || [];
+      const appliedHtml = applied.map(c =>
+        `<div style="margin-top:4px;"><code>${escapeHtml(c.short_sha)}</code> ${escapeHtml(c.subject || '')}</div>`
+      ).join('');
+      const restartHint = apply.restart_required
+        ? `<div style="margin-top:8px;color:var(--warning);">Чтобы изменения вступили в силу, перезапустите стек: <code>bash start.sh restart</code>.</div>`
+        : '';
+      showPanel(
+        `<b>Применено ${applied.length} коммит(ов)</b>. HEAD теперь <code>${escapeHtml(apply.short_sha || '')}</code>.` +
+        appliedHtml + restartHint,
+        'var(--success)',
+      );
+      setStatus('✓ Обновление применено', 'var(--success)');
+      await refreshVersionInfo();
+    } catch (e) {
+      setStatus('✗ ' + (e.message || 'ошибка'), 'var(--error)');
+      showPanel(escapeHtml(e.message || 'Сетевая ошибка'), 'var(--error)');
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  function init() {
+    const btn = document.getElementById('updatesCheckBtn');
+    if (btn && !btn._wired) {
+      btn._wired = true;
+      btn.addEventListener('click', checkAndUpdate);
+    }
+    // Лениво подгружаем version info, когда карточка реально открыта.
+    const card = document.getElementById('updatesSettingsCard');
+    if (card) {
+      const header = card.querySelector('.settings-card-header');
+      header?.addEventListener('click', () => {
+        // Откладываем на следующий тик — toggleSettingsCard сам выставит .open
+        setTimeout(() => {
+          if (card.classList.contains('open')) refreshVersionInfo();
+        }, 0);
+      });
+      // Если карточка уже открыта при загрузке — подтянуть сразу.
+      if (card.classList.contains('open')) refreshVersionInfo();
+    }
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
+  }
+})();
 
 // Синхронизирует UI с текущей рабочей областью VFS:
 // • поле ввода workspace dir получает актуальное значение,
