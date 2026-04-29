@@ -8521,6 +8521,20 @@ const toolDefs = [
         required: ['path']
       }
     }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'finish_task',
+      description: 'Signal that the entire task is complete and you have nothing more to do. Call this LAST, after all work is finished and (if a plan exists) every plan step is marked done via update_plan. The "summary" you provide here becomes your final reply to the user — write it as if speaking directly to them. The agent loop ENDS only when you call finish_task; otherwise the system will keep prompting you to continue. Do NOT call finish_task while you still have pending steps or unresolved errors.',
+      parameters: {
+        type: 'object',
+        properties: {
+          summary: { type: 'string', description: 'Final user-facing message: what you accomplished, key results, files changed, etc. Plain text or markdown. This is shown to the user as your closing message.' }
+        },
+        required: ['summary']
+      }
+    }
   }
 ];
 
@@ -11675,6 +11689,9 @@ Planning (optional):
 Delegation (optional):
 - delegate_task(task, context?, step_title) — send a micro-task to an isolated sub-agent. The sub-agent has file tools but zero memory of this conversation. Describe everything it needs. Useful for parallelizing work or isolating complex subtasks.
 
+Completion:
+- finish_task(summary) — REQUIRED to end your turn. The agent loop runs continuously until you explicitly call this tool. A plain text reply WITHOUT a tool call does NOT finish the task — the system will nudge you to either keep working or call finish_task. The "summary" becomes your final user-facing reply. Call finish_task only when ALL work is genuinely done (and, if a plan exists, every step is marked done via update_plan first). Even for trivial requests like greetings, end with finish_task("Hello! ...").
+
 TIPS:
 - Read before edit. Use read_file(path, start_line, end_line) to load ONLY the relevant section — saves context and is faster.
 - For surgical edits: str_replace is the primary tool. Copy the target text verbatim from read_file output, include ±2 lines of context to ensure uniqueness.
@@ -11768,7 +11785,7 @@ RULES:
 - After edit_lines/insert_content, line numbers shift — re-read before next edit.
 - If changing >50% of a file, rewrite it entirely with write_file.
 - Focus on QUALITY: clean code, proper naming, correct logic.
-- When finished, reply with a BRIEF report (2-5 sentences): what you did, which files changed, any decisions you made.`;
+- To FINISH, call finish_task(summary) with a BRIEF report (2-5 sentences): what you did, which files changed, any decisions you made. The agent loop ends only when finish_task is called — a plain text reply alone does NOT finish your turn.`;
 
 // Tools available to sub-agents (no delegate_task, no update_plan)
 function getSubAgentToolDefs() {
@@ -11838,61 +11855,111 @@ async function runSubAgent(task, context = '', stepTitle = 'Sub-task', uiElement
     subLog.push({ icon: 'play', text: `Запуск: ${stepTitle}` });
     updateUI(subLog, 'работает...', 'working');
 
-    // Call model for the sub-agent
-    let apiMessages = prepareSubMessages(subMessages);
-    let msg = await callSubAgentModel(apiMessages, subToolDefs);
-    
-    // Tool execution loop
-    while (msg && msg.tool_calls && msg.tool_calls.length && step < MAX_SUB_STEPS) {
-      for (const call of msg.tool_calls) {
-        const name = call.function.name;
-        const args = safeParseToolArgs(call.function.arguments);
-        
-        // Skip forbidden tools
-        if (name === 'delegate_task' || name === 'update_plan') {
-          subMessages.push({ role: msg.role, content: msg.content || null, tool_calls: msg.tool_calls, _geminiParts: msg._geminiParts });
-          subMessages.push({ role: 'tool', tool_call_id: call.id, name, content: JSON.stringify({ error: 'This tool is not available to sub-agents.' }) });
-          subLog.push({ icon: 'ban', text: `${name} — недоступен для суб-агента` });
-          continue;
-        }
+    // ─── Unified non-stop sub-agent loop ────────────────────────────────────
+    // Exits ONLY on: explicit finish_task call, MAX_SUB_STEPS, or 2 consecutive
+    // empty replies (no tool_calls + no finish_task).
+    const MAX_SUB_NO_TOOL = 2;
+    let subConsecutiveNoTool = 0;
+    let subFinishSummary = null;
+    let lastAssistantText = '';
 
-        const humanText = humanizeToolCall(name, args);
-        subLog.push({ icon: 'wrench', text: humanText });
-        updateUI(subLog, `шаг ${step + 1}...`, '');
+    while (step < MAX_SUB_STEPS && subFinishSummary === null) {
+      const apiMessages = prepareSubMessages(subMessages);
+      let msg;
+      try {
+        msg = await callSubAgentModel(apiMessages, subToolDefs);
+      } catch (e) {
+        if (e.name === 'AbortError') throw e;
+        subLog.push({ icon: 'x-circle', text: `Ошибка модели: ${e.message}` });
+        updateUI(subLog, `шаг ${step + 1}...`, 'working');
+        subMessages.push({
+          role: 'user',
+          content: `[Системное сообщение] При обращении к модели произошла ошибка: ${e.message}. Не повторяй уже сделанное. Когда задача выполнена — вызови finish_task(summary).`
+        });
+        step++;
+        continue;
       }
 
-      subMessages.push({ role: msg.role, content: msg.content || null, tool_calls: msg.tool_calls, _geminiParts: msg._geminiParts });
+      if (msg && msg.tool_calls && msg.tool_calls.length) {
+        subConsecutiveNoTool = 0;
 
-      for (const call of msg.tool_calls) {
-        const name = call.function.name;
-        if (name === 'delegate_task' || name === 'update_plan') continue;
-        let args = {};
-        try { args = safeParseToolArgs(call.function.arguments); } catch {}
-        let result;
-        try {
-          // 🔌 MCP routing inside sub-agent
-          const mcpResolved = (typeof MCPRegistry !== 'undefined') ? MCPRegistry.resolveTool(name) : null;
-          if (mcpResolved) {
-            const raw = await mcpResolved.server.client.callTool(mcpResolved.toolName, args);
-            result = normalizeMCPResult(raw);
+        // Render labels + detect forbidden / finish_task
+        for (const call of msg.tool_calls) {
+          const name = call.function.name;
+          const args = safeParseToolArgs(call.function.arguments);
+          if (name === 'delegate_task' || name === 'update_plan') {
+            subLog.push({ icon: 'ban', text: `${name} — недоступен для суб-агента` });
           } else {
-            result = await toolImpl[name](args);
+            subLog.push({ icon: 'wrench', text: humanizeToolCall(name, args) });
           }
-        } catch (e) {
-          result = { error: String(e.message || e) };
-          subLog.push({ icon: 'x-circle', text: `Ошибка ${name}: ${e.message}` });
         }
-        subMessages.push({ role: 'tool', tool_call_id: call.id, name, content: JSON.stringify(result) });
+        updateUI(subLog, `шаг ${step + 1}...`, '');
+
+        // Push assistant turn into history
+        subMessages.push({
+          role: msg.role,
+          content: msg.content || null,
+          tool_calls: msg.tool_calls,
+          _geminiParts: msg._geminiParts
+        });
+
+        // Execute every call
+        for (const call of msg.tool_calls) {
+          const name = call.function.name;
+          if (name === 'delegate_task' || name === 'update_plan') {
+            subMessages.push({ role: 'tool', tool_call_id: call.id, name, content: JSON.stringify({ error: 'This tool is not available to sub-agents.' }) });
+            continue;
+          }
+          if (name === 'finish_task') {
+            const a = safeParseToolArgs(call.function.arguments);
+            subFinishSummary = (a && typeof a.summary === 'string') ? a.summary : '';
+            subMessages.push({ role: 'tool', tool_call_id: call.id, name, content: JSON.stringify({ ok: true }) });
+            continue;
+          }
+          let args = {};
+          try { args = safeParseToolArgs(call.function.arguments); } catch {}
+          let result;
+          try {
+            const mcpResolved = (typeof MCPRegistry !== 'undefined') ? MCPRegistry.resolveTool(name) : null;
+            if (mcpResolved) {
+              const raw = await mcpResolved.server.client.callTool(mcpResolved.toolName, args);
+              result = normalizeMCPResult(raw);
+            } else {
+              result = await toolImpl[name](args);
+            }
+          } catch (e) {
+            result = { error: String(e.message || e) };
+            subLog.push({ icon: 'x-circle', text: `Ошибка ${name}: ${e.message}` });
+          }
+          subMessages.push({ role: 'tool', tool_call_id: call.id, name, content: JSON.stringify(result) });
+        }
+        await refreshFilesPanel();
+        step++;
+        continue;
       }
 
-      await refreshFilesPanel();
-      apiMessages = prepareSubMessages(subMessages);
-      msg = await callSubAgentModel(apiMessages, subToolDefs);
+      // No tool_calls — nudge and retry (up to MAX_SUB_NO_TOOL times)
+      subConsecutiveNoTool++;
+      lastAssistantText = (msg && msg.content) ? String(msg.content) : '';
+      if (lastAssistantText.trim()) {
+        subMessages.push({ role: 'assistant', content: lastAssistantText });
+      }
+      if (subConsecutiveNoTool >= MAX_SUB_NO_TOOL) {
+        subLog.push({ icon: 'alert-circle', text: 'Не вызвал finish_task — завершаю принудительно' });
+        break;
+      }
+      subMessages.push({
+        role: 'user',
+        content: `[Системное напоминание] Ты ответил текстом, но не вызвал ни одного инструмента и не вызвал finish_task. Текстовый ответ не завершает работу. Если задача выполнена — вызови finish_task(summary). Если нет — продолжай работать инструментами.`
+      });
+      updateUI(subLog, `шаг ${step + 1}...`, 'working');
       step++;
     }
 
-    // Extract final report
-    const report = msg?.content || '(Суб-агент не предоставил отчёт)';
+    // Final report: prefer finish_task summary, fallback to last text
+    const report = subFinishSummary !== null
+      ? (subFinishSummary.trim() || lastAssistantText || 'Готово')
+      : (lastAssistantText || '(Суб-агент не предоставил отчёт)');
     subLog.push({ icon: 'check-circle', text: 'Завершено' });
     updateUI(subLog, '✓ готово', 'done');
 
@@ -12365,6 +12432,9 @@ function humanizeToolCall(name, args) {
   if (name === 'use_skill') {
     return ic('layers') + 'Скил: ' + (args.skill_name || '');
   }
+  if (name === 'finish_task') {
+    return ic('check-circle') + 'Завершение задачи';
+  }
   return ic('zap') + name;
 }
 /* ========= Агентный цикл с задержкой ========= */
@@ -12515,15 +12585,26 @@ async function runAgent(userText) {
     return result;
   };
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Единый non-stop agent-loop. Цикл выходит ТОЛЬКО по:
+  //  1) явному вызову finish_task,
+  //  2) лимиту шагов (MAX_STEPS),
+  //  3) лимиту подряд идущих "пустых" ответов (no tool_calls + no finish_task),
+  //  4) лимиту подряд идущих ошибок callModel,
+  //  5) AbortError (пользователь нажал стоп).
+  // Ошибки callModel и пустые ответы НЕ останавливают работу — модели пушится
+  // системное напоминание и цикл продолжается.
+  // ═══════════════════════════════════════════════════════════════════════════
+  const MAX_STEPS = 80;
+  const MAX_CONSECUTIVE_NO_TOOL = 3;
+  const MAX_CONSECUTIVE_ERRORS = 3;
   let step = 0;
+  let consecutiveNoTool = 0;
+  let consecutiveErrors = 0;
+  let finishSummary = null;
   try {
-    setStatus('Модель думает...', 'working');
-    let apiMessages = prepareMessagesForAPI(chat.messages);
-    let msg = await callModelWithRetry(apiMessages);
-    if (msg.reasoning) {
-      addMsg('assistant', msg.reasoning, true);
-    }
-    while (msg && msg.tool_calls && msg.tool_calls.length) {
+    while (step < MAX_STEPS && finishSummary === null) {
+      // Inter-step delay
       const enableDelay = document.getElementById('enableDelay').checked;
       const delaySeconds = parseInt(document.getElementById('delaySeconds').value) || 10;
       if (enableDelay && step > 0) {
@@ -12532,234 +12613,156 @@ async function runAgent(userText) {
         await delayWithProgress(delaySeconds);
         removeWaitingMessage(waitingMsgId);
       }
-      setStatus(`Выполнение (шаг ${step + 1})...`, 'working');
-      for (let _ci = 0; _ci < msg.tool_calls.length; _ci++) {
-        const call = msg.tool_calls[_ci];
-        const name = call.function.name;
-        const args = safeParseToolArgs(call.function.arguments);
-        const humanText = name === 'delegate_task' 
-          ? `🤖 Делегирование: ${args.step_title || 'подзадача'}`
-          : humanizeToolCall(name, args);
-        addToolAction(humanText, _ci === 0 ? (msg.content || null) : null);
-      }
-      chat.messages.push({
-        role: msg.role,
-        content: msg.content || null,
-        tool_calls: msg.tool_calls,
-        _geminiParts: msg._geminiParts
-      });
-      for (const call of msg.tool_calls) {
-        const result = await executeToolCall(call);
-        // ⚡ Compact terminal widget in chat
-        if (call.function.name === 'run_terminal') {
-          const args = safeParseToolArgs(call.function.arguments);
-          renderTerminalWidget(args.command || '', result);
-        }
-        // ⚡ Compact browser widget in chat
-        if (call.function.name === 'browser_action') {
-          const args = safeParseToolArgs(call.function.arguments);
-          renderBrowserWidget(args.command || '', args.description || '', result);
-        }
-        // ⚡ view_image: store image data separately, send clean text result to API
-        const imageData = (call.function.name === 'view_image' && result._isImage)
-          ? { path: result.path, mime: result.mime, base64: result._base64 }
-          : null;
-        const cleanResult = imageData
-          ? { path: result.path, mime: result.mime, status: result.status }
-          : result;
-        chat.messages.push({
-          role: 'tool',
-          tool_call_id: call.id,
-          name: call.function.name, 
-          content: JSON.stringify(cleanResult),
-          _imageData: imageData
-        });
-      }
-      await refreshFilesPanel();
-      // ═══ ИНЪЕКЦИЯ: проверяем есть ли сообщения, отправленные пока модель работала ═══
+
+      // Inject any messages the user sent while we were working
       if (pendingInjections.length > 0) {
         const injItems = pendingInjections.splice(0);
         const combined = injItems.map(i => i.text).join('\n\n');
         injItems.forEach(i => markInjectionDelivered(i.elId));
         chat.messages.push({ role: 'user', content: `[Пользователь добавил информацию в процессе работы]: ${combined}` });
-        setStatus('Применяем дополнение...', 'working');
       }
-      // ════════════════════════════════════════════════════════════════════════════════
-      setStatus('Анализ результатов...', 'working');
-      apiMessages = prepareMessagesForAPI(chat.messages);
-      msg = await callModelWithRetry(apiMessages);
-      if (msg.reasoning) {
-        addMsg('assistant', msg.reasoning, true);
-      }
-      step++;
-    }
-    // Логика обработки финального ответа с полноценным автопродолжением
-    if (msg && msg.content) {
-      // ⭐ Проверка: все ли шаги плана выполнены
-      const planProgress = getPlanProgress();
-      if (currentPlan.length > 0 && !planProgress.complete && step < 50) {
-        // План не завершён — отправляем агента обратно
-        console.warn(`[PLAN] План не завершён: ${planProgress.done}/${planProgress.total}. Отправляем на доработку.`);
-        // Показываем частичный ответ
-        if (msg.content.trim()) {
-          await addMsg('assistant', msg.content);
+
+      setStatus(step === 0 ? 'Модель думает...' : `Анализ результатов (шаг ${step + 1})...`, 'working');
+
+      // Call model. On error → push a system note and continue (don't break).
+      let msg;
+      try {
+        const apiMessages = prepareMessagesForAPI(chat.messages);
+        msg = await callModelWithRetry(apiMessages);
+        consecutiveErrors = 0;
+      } catch (e) {
+        if (e.name === 'AbortError') throw e;
+        consecutiveErrors++;
+        const errMsg = String(e.message || e);
+        console.error('[AGENT] callModel error:', e);
+        addMsg('system', '⚠️ Ошибка модели: ' + errMsg + (consecutiveErrors < MAX_CONSECUTIVE_ERRORS ? ' — пробую продолжить...' : ''));
+        if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+          addMsg('system', `⛔ ${MAX_CONSECUTIVE_ERRORS} ошибки подряд. Останавливаю автопродолжение — напишите «продолжи», чтобы попробовать снова.`);
+          break;
         }
-        // Запрашиваем продолжение
         chat.messages.push({
           role: 'user',
-          content: `IMPORTANT: Your plan is NOT complete yet (${planProgress.done}/${planProgress.total} steps done). The remaining uncompleted steps are: ${currentPlan.filter(s => !s.done).map(s => '"' + s.title + '"').join(', ')}. Please continue working and call update_plan to mark steps as done. Do NOT stop until all steps are done.`
+          content: `[Системное сообщение] При обращении к модели произошла ошибка: ${errMsg}. Не повторяй уже сделанное. Если задача ещё не завершена — продолжай работать инструментами; когда всё готово — вызови finish_task(summary).`
         });
-        setStatus(`⚠️ План не завершён (${planProgress.done}/${planProgress.total}), продолжаем...`, 'working');
-        apiMessages = prepareMessagesForAPI(chat.messages);
-        msg = await callModelWithRetry(apiMessages);
-        if (msg.reasoning) addMsg('assistant', msg.reasoning, true);
-        
-        // Continue the tool loop
-        let planRetrySteps = 0;
-        const MAX_PLAN_RETRIES = 30;
-        while (msg && msg.tool_calls && msg.tool_calls.length && planRetrySteps < MAX_PLAN_RETRIES) {
-          setStatus(`Выполнение плана (шаг ${step + planRetrySteps + 1})...`, 'working');
-          for (let _ci = 0; _ci < msg.tool_calls.length; _ci++) {
-            const call = msg.tool_calls[_ci];
-            const name = call.function.name;
-            const args = safeParseToolArgs(call.function.arguments);
-            const humanText = name === 'delegate_task'
-              ? `🤖 Делегирование: ${args.step_title || 'подзадача'}`
-              : humanizeToolCall(name, args);
-            addToolAction(humanText, _ci === 0 ? (msg.content || null) : null);
-          }
-          for (const call of msg.tool_calls) {
-            const result = await executeToolCall(call);
-            if (call.function.name === 'run_terminal') {
-              renderTerminalWidget(safeParseToolArgs(call.function.arguments).command || '', result);
-            }
-            if (call.function.name === 'browser_action') {
-              const a = safeParseToolArgs(call.function.arguments);
-              renderBrowserWidget(a.command || '', a.description || '', result);
-            }
-            const imgData2 = (call.function.name === 'view_image' && result._isImage)
-              ? { path: result.path, mime: result.mime, base64: result._base64 } : null;
-            chat.messages.push({ role: 'tool', tool_call_id: call.id, name: call.function.name,
-              content: JSON.stringify(imgData2 ? { path: result.path, mime: result.mime, status: result.status } : result),
-              _imageData: imgData2 });
-          }
-          await refreshFilesPanel();
-          apiMessages = prepareMessagesForAPI(chat.messages);
-          msg = await callModelWithRetry(apiMessages);
-          if (msg && msg.reasoning) addMsg('assistant', msg.reasoning, true);
-          planRetrySteps++;
-          
-          // Check if plan is now complete to avoid infinite loops
-          const newProgress = getPlanProgress();
-          if (newProgress.complete) break;
-        }
-        // Now show final response
-        if (msg && msg.content) {
-          await addMsg('assistant', msg.content);
-        } else {
-          await addMsg('assistant', '✅ План выполнен.');
-        }
-      } else {
-        await addMsg('assistant', msg.content);
+        step++;
+        continue;
       }
-    } else {
-      // Модель вернула пустой content — возможно обрезало по лимиту токенов
-      console.warn('[AGENT] Модель вернула пустой content. Проверяем контекст...');
-      
-      const recentMessages = chat.messages.slice(-20);
-      const hasRecentToolCalls = recentMessages.some(m => m.tool_calls && m.tool_calls.length > 0);
-      
-      if (hasRecentToolCalls) {
-        // Были недавние действия, но модель молчит — автопродолжение через полный цикл
-        console.warn('[AGENT] Обнаружены недавние tool_calls, но нет финального ответа. Запускаем полный цикл продолжения...');
-        
-        const MAX_CONTINUE_STEPS = 30;
-        let continueStep = 0;
-        
-        try {
-          chat.messages.push({
-            role: 'user',
-            content: 'Continue the task. Make sure all files are created and the task is complete. Give a brief summary.'
-          });
-          
-          setStatus('Запрос продолжения работы...', 'working');
-          apiMessages = prepareMessagesForAPI(chat.messages);
-          msg = await callModelWithRetry(apiMessages);
-          
-          if (msg && msg.reasoning) {
-            addMsg('assistant', msg.reasoning, true);
-          }
-          
-          // ⭐ Полноценный while-loop — точно такой же как основной
-          while (msg && msg.tool_calls && msg.tool_calls.length && continueStep < MAX_CONTINUE_STEPS) {
-            const enableDelay = document.getElementById('enableDelay').checked;
-            const delaySeconds = parseInt(document.getElementById('delaySeconds').value) || 10;
-            if (enableDelay && continueStep > 0) {
-              const waitingMsgId = addWaitingMessage(`Задержка ${delaySeconds} сек перед следующим действием...`);
-              setStatus(`⏳ Ожидание ${delaySeconds} сек...`, 'waiting');
-              await delayWithProgress(delaySeconds);
-              removeWaitingMessage(waitingMsgId);
-            }
-            setStatus(`Продолжение (шаг ${step + continueStep + 1})...`, 'working');
-            
-            for (let _ci = 0; _ci < msg.tool_calls.length; _ci++) {
-              const call = msg.tool_calls[_ci];
-              const name = call.function.name;
-              const args = safeParseToolArgs(call.function.arguments);
-              const humanText = name === 'delegate_task'
-                ? `🤖 Делегирование: ${args.step_title || 'подзадача'}`
-                : humanizeToolCall(name, args);
-              addToolAction(humanText, _ci === 0 ? (msg.content || null) : null);
-            }
+
+      if (msg && msg.reasoning) {
+        addMsg('assistant', msg.reasoning, true);
+      }
+
+      // ── Branch 1: model returned tool_calls (possibly including finish_task) ──
+      if (msg && msg.tool_calls && msg.tool_calls.length) {
+        consecutiveNoTool = 0;
+        const finishCall = msg.tool_calls.find(c => c.function.name === 'finish_task');
+
+        // Render tool action labels
+        setStatus(`Выполнение (шаг ${step + 1})...`, 'working');
+        for (let _ci = 0; _ci < msg.tool_calls.length; _ci++) {
+          const call = msg.tool_calls[_ci];
+          const name = call.function.name;
+          const args = safeParseToolArgs(call.function.arguments);
+          const humanText = name === 'delegate_task'
+            ? `🤖 Делегирование: ${args.step_title || 'подзадача'}`
+            : humanizeToolCall(name, args);
+          addToolAction(humanText, _ci === 0 ? (msg.content || null) : null);
+        }
+
+        // Push assistant turn (with tool_calls) into history
+        chat.messages.push({
+          role: msg.role,
+          content: msg.content || null,
+          tool_calls: msg.tool_calls,
+          _geminiParts: msg._geminiParts
+        });
+
+        // Execute every tool. finish_task is handled inline (no toolImpl).
+        for (const call of msg.tool_calls) {
+          const callName = call.function.name;
+          if (callName === 'finish_task') {
+            const a = safeParseToolArgs(call.function.arguments);
+            finishSummary = (a && typeof a.summary === 'string') ? a.summary : '';
             chat.messages.push({
-              role: msg.role,
-              content: msg.content || null,
-              tool_calls: msg.tool_calls,
-              _geminiParts: msg._geminiParts
+              role: 'tool',
+              tool_call_id: call.id,
+              name: 'finish_task',
+              content: JSON.stringify({ ok: true })
             });
-            for (const call of msg.tool_calls) {
-              const result = await executeToolCall(call);
-              if (call.function.name === 'run_terminal') {
-                renderTerminalWidget(safeParseToolArgs(call.function.arguments).command || '', result);
-              }
-              if (call.function.name === 'browser_action') {
-                const a = safeParseToolArgs(call.function.arguments);
-                renderBrowserWidget(a.command || '', a.description || '', result);
-              }
-              const imgData3 = (call.function.name === 'view_image' && result._isImage)
-                ? { path: result.path, mime: result.mime, base64: result._base64 } : null;
-              chat.messages.push({ role: 'tool', tool_call_id: call.id, name: call.function.name,
-                content: JSON.stringify(imgData3 ? { path: result.path, mime: result.mime, status: result.status } : result),
-                _imageData: imgData3 });
-            }
-            await refreshFilesPanel();
-            setStatus('Анализ результатов...', 'working');
-            apiMessages = prepareMessagesForAPI(chat.messages);
-            msg = await callModelWithRetry(apiMessages);
-            if (msg && msg.reasoning) {
-              addMsg('assistant', msg.reasoning, true);
-            }
-            continueStep++;
+            continue;
           }
-          
-          // Финальный ответ после цикла продолжения
-          if (msg && msg.content) {
-            await addMsg('assistant', msg.content);
-          } else if (continueStep >= MAX_CONTINUE_STEPS) {
-            addMsg('system', `⚠️ Достигнут лимит автопродолжения (${MAX_CONTINUE_STEPS} шагов).`);
-            addMsg('system', '💡 Напишите «продолжи» для ручного продолжения работы.');
-          } else {
-            addMsg('assistant', 'Выполнено.');
+          const result = await executeToolCall(call);
+          if (callName === 'run_terminal') {
+            const args = safeParseToolArgs(call.function.arguments);
+            renderTerminalWidget(args.command || '', result);
           }
-        } catch (continueError) {
-          console.error('[AGENT] Ошибка при автопродолжении:', continueError);
-          addMsg('system', '⚠️ Не удалось автоматически продолжить: ' + continueError.message);
-          addMsg('system', '💡 Попробуйте написать «продолжи» для ручного продолжения работы.');
+          if (callName === 'browser_action') {
+            const args = safeParseToolArgs(call.function.arguments);
+            renderBrowserWidget(args.command || '', args.description || '', result);
+          }
+          const imageData = (callName === 'view_image' && result && result._isImage)
+            ? { path: result.path, mime: result.mime, base64: result._base64 }
+            : null;
+          const cleanResult = imageData
+            ? { path: result.path, mime: result.mime, status: result.status }
+            : result;
+          chat.messages.push({
+            role: 'tool',
+            tool_call_id: call.id,
+            name: callName,
+            content: JSON.stringify(cleanResult),
+            _imageData: imageData
+          });
         }
-      } else {
-        addMsg('assistant', 'Готово');
+        await refreshFilesPanel();
+
+        // finishCall present → exit loop, finishSummary already set
+        step++;
+        continue;
       }
+
+      // ── Branch 2: model returned NO tool_calls ──
+      // This is NOT a stop signal: nudge it back into the loop.
+      consecutiveNoTool++;
+      const partialText = (msg && msg.content) ? String(msg.content) : '';
+
+      // Push the model's text into history so it sees its own previous reply,
+      // and render it for the user (без typing-анимации, чтобы не путать с финалом).
+      if (partialText.trim()) {
+        chat.messages.push({ role: 'assistant', content: partialText });
+        ChatManager.updateMessages(chat.messages);
+        renderChatMessage('assistant', partialText, false, false);
+      }
+
+      if (consecutiveNoTool >= MAX_CONSECUTIVE_NO_TOOL) {
+        addMsg('system', `⚠️ Модель ${MAX_CONSECUTIVE_NO_TOOL} раза подряд не вызвала ни одного инструмента и не вызвала finish_task. Останавливаю автопродолжение — напишите «продолжи» или уточните задачу.`);
+        break;
+      }
+
+      // Build context-aware nudge
+      const planProgress = getPlanProgress();
+      let nudgeText;
+      if (currentPlan.length > 0 && !planProgress.complete) {
+        const remaining = currentPlan.filter(s => !s.done).map(s => '"' + s.title + '"').join(', ');
+        nudgeText = `[Системное напоминание] Ты ответил текстом, но не вызвал ни одного инструмента — работа НЕ завершена. План ещё не выполнен (${planProgress.done}/${planProgress.total}). Остаются шаги: ${remaining}. Не повторяй уже сделанное — продолжай ровно с того места, где остановился: вызывай инструменты и помечай шаги через update_plan. Когда задача действительно завершена — вызови finish_task(summary). Текстовый ответ без tool_call работу НЕ завершает.`;
+      } else {
+        nudgeText = `[Системное напоминание] Ты ответил текстом, но не вызвал ни одного инструмента — работа НЕ завершена. Если задача действительно выполнена — вызови finish_task(summary), и твой текст станет финальным ответом пользователю. Если ещё нет — продолжай работать инструментами, не повторяй уже сделанное.`;
+      }
+      chat.messages.push({ role: 'user', content: nudgeText });
+      setStatus('⚠️ Нет вызова инструмента — напоминаем модели...', 'working');
+      step++;
     }
+
+    // ─── Loop finished. Finalize. ────────────────────────────────────────────
+    if (finishSummary !== null) {
+      const out = finishSummary && finishSummary.trim()
+        ? finishSummary
+        : 'Готово';
+      await addMsg('assistant', out);
+    } else if (step >= MAX_STEPS) {
+      addMsg('system', `⚠️ Достигнут лимит шагов (${MAX_STEPS}). Напишите «продолжи» для продолжения работы.`);
+    }
+
     ChatManager.updateMessages(chat.messages);
     await refreshFilesPanel();
     setStatus('Готово', 'ok');
