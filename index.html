@@ -12232,6 +12232,19 @@ function addErrorAction(label) {
   ChatManager.updateMessages(chat.messages);
   renderToolAction(text);
 }
+// Показывает system-уведомление в UI чата, но помечает его _ephemeral:true,
+// чтобы оно НЕ попало в API-историю и было удалено из chat.messages при
+// завершении текущего run'а. Используется для предупреждений о лимитах
+// агентного цикла, остановках по AbortError и т.п. — то, что важно показать
+// пользователю прямо сейчас, но не должно засорять долгую историю чата.
+function addEphemeralSystem(text) {
+  const chat = ChatManager.getActive();
+  if (!chat) return;
+  chat.messages.push({ role: 'system', content: text, _ephemeral: true });
+  ChatManager.updateMessages(chat.messages);
+  renderChatMessage('system', text, false, false);
+}
+
 function addWaitingMessage(text) {
   const chat = ChatManager.getActive();
   if (!chat) return;
@@ -12504,6 +12517,16 @@ function humanizeToolCall(name, args) {
 async function runAgent(userText) {
   const chat = ChatManager.getActive();
   if (!chat) return;
+  // Defensive: drop any leftover _ephemeral messages from a previous run that
+  // may have errored out before reaching the cleanup in finally. Synthetic
+  // system reminders / errors / loop-limit warnings should never persist into
+  // the next user turn — some providers (e.g. qwen.aikit.club) rely on the
+  // shape of the last-message and break when an unexpected synthetic user
+  // message lingers in history.
+  if (chat.messages.some(m => m._ephemeral)) {
+    chat.messages = chat.messages.filter(m => !m._ephemeral);
+    ChatManager.updateMessages(chat.messages);
+  }
   const skillsAddition = (typeof SkillsEngine !== 'undefined') ? SkillsEngine.getSkillsListPrompt() : '';
   const workspaceCtx = getWorkspaceContextBlock();
   const effectiveSystemPrompt = getSystemPrompt() + skillsAddition + workspaceCtx;
@@ -12713,7 +12736,8 @@ async function runAgent(userText) {
         }
         chat.messages.push({
           role: 'user',
-          content: `[Системное сообщение] При обращении к модели произошла ошибка: ${errMsg}. Не повторяй уже сделанное. Если задача ещё не завершена — продолжай работать инструментами; когда всё готово — вызови end_task.`
+          content: `[Системное сообщение] При обращении к модели произошла ошибка: ${errMsg}. Не повторяй уже сделанное. Если задача ещё не завершена — продолжай работать инструментами; когда всё готово — вызови end_task.`,
+          _ephemeral: true
         });
         step++;
         continue;
@@ -12842,7 +12866,7 @@ async function runAgent(userText) {
       }
 
       if (consecutiveNoTool >= MAX_CONSECUTIVE_NO_TOOL) {
-        addMsg('system', `⚠️ Модель ${MAX_CONSECUTIVE_NO_TOOL} раза подряд не вызвала ни одного инструмента и не вызвала end_task. Останавливаю автопродолжение — напишите «продолжи» или уточните задачу.`);
+        addEphemeralSystem(`⚠️ Модель ${MAX_CONSECUTIVE_NO_TOOL} раза подряд не вызвала ни одного инструмента и не вызвала end_task. Останавливаю автопродолжение — напишите «продолжи» или уточните задачу.`);
         break;
       }
 
@@ -12855,7 +12879,7 @@ async function runAgent(userText) {
       } else {
         nudgeText = `[Системное напоминание] Ты ответил текстом, но не вызвал ни одного инструмента — сам по себе текст работу НЕ завершает. Если задача действительно выполнена — вызови end_task() БЕЗ аргументов в следующем turn'е, и твой только что написанный текст автоматически станет финальным ответом пользователю (дублировать его в end_message не нужно). Если ещё нет — продолжай работать инструментами, не повторяй уже сделанное.`;
       }
-      chat.messages.push({ role: 'user', content: nudgeText });
+      chat.messages.push({ role: 'user', content: nudgeText, _ephemeral: true });
       setStatus('⚠️ Нет вызова инструмента — напоминаем модели...', 'working');
       step++;
     }
@@ -12876,7 +12900,7 @@ async function runAgent(userText) {
         await addMsg('assistant', out);
       }
     } else if (step >= MAX_STEPS) {
-      addMsg('system', `⚠️ Достигнут лимит шагов (${MAX_STEPS}). Напишите «продолжи» для продолжения работы.`);
+      addEphemeralSystem(`⚠️ Достигнут лимит шагов (${MAX_STEPS}). Напишите «продолжи» для продолжения работы.`);
     }
 
     ChatManager.updateMessages(chat.messages);
@@ -12884,12 +12908,22 @@ async function runAgent(userText) {
     setStatus('Готово', 'ok');
   } catch (e) {
     if (e.name === 'AbortError') {
-      addMsg('system', '<i data-lucide="circle-stop" style="width:12px;height:12px;display:inline-block;vertical-align:middle;margin-right:4px;opacity:0.6;"></i> Генерация остановлена');
+      addEphemeralSystem('<i data-lucide="circle-stop" style="width:12px;height:12px;display:inline-block;vertical-align:middle;margin-right:4px;opacity:0.6;"></i> Генерация остановлена');
       if (window.lucide) window.lucide.createIcons();
     } else {
       throw e;
     }
   } finally {
+    // Strip _ephemeral messages (synthetic system reminders, error notes,
+    // loop-limit warnings) so they never persist into the saved chat history.
+    // They've already been seen by the model within this run; keeping them
+    // in chat.messages would (a) pollute the next user turn's API request and
+    // (b) break providers like qwen.aikit.club that look at the shape of the
+    // last messages for chat-id tracking.
+    if (chat && chat.messages && chat.messages.some(m => m._ephemeral)) {
+      chat.messages = chat.messages.filter(m => !m._ephemeral);
+      ChatManager.updateMessages(chat.messages);
+    }
     sendBtn.innerHTML = '<i data-lucide="arrow-up" style="width:15px;height:15px;"></i>'; if(window.lucide)window.lucide.createIcons();
     sendBtn.classList.remove('stop-btn');
     currentAbortController = null;
