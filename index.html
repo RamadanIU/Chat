@@ -4911,7 +4911,17 @@ button:disabled, .icon-btn:disabled, input:disabled, textarea:disabled {
               NVIDIA Base URL
             </label>
             <input id="nvidiaBase" type="text" placeholder="https://integrate.api.nvidia.com/v1" />
-            <div style="margin-top:5px;display:flex;gap:6px;align-items:center;">
+
+            <label style="display:flex;align-items:center;gap:6px;margin-top:10px;">
+              <i data-lucide="shield" style="width:14px;height:14px;color:var(--text-2);"></i>
+              CORS‑прокси
+            </label>
+            <input id="nvidiaProxy" type="text" placeholder="https://corsproxy.io/?" />
+            <div style="margin-top:3px;font-size:10px;color:var(--text-2);line-height:1.4;">
+              Нужен для работы из браузера (обход CORS). Оставьте пустым если запросы идут через собственный self-hosted NIM или backend-прокси.
+            </div>
+
+            <div style="margin-top:8px;display:flex;gap:6px;align-items:center;">
               <button id="nvidiaTestBtn" style="flex:1;padding:6px 10px;border-radius:var(--r-md);border:1px solid var(--border-focus);background:var(--bg-3);color:var(--text-0);font-size:11px;font-weight:600;cursor:pointer;font-family:var(--font-sans);display:flex;align-items:center;justify-content:center;gap:5px;">
                 <i data-lucide="wifi" style="width:12px;height:12px;"></i> Проверить ключ
               </button>
@@ -5985,9 +5995,11 @@ function saveSettings() {
   const deepseekBase = (document.getElementById('deepseekBase').value || '').trim();
   if (deepseekBase) localStorage.setItem('agent_deepseek_base', deepseekBase);
   localStorage.setItem('agent_deepseek_show_thinking', document.getElementById('deepseekShowThinking').checked.toString());
-  // NVIDIA NIM base URL + reasoning + streaming toggles
+  // NVIDIA NIM base URL + proxy + reasoning + streaming toggles
   const nvidiaBase = (document.getElementById('nvidiaBase').value || '').trim();
   if (nvidiaBase) localStorage.setItem('agent_nvidia_base', nvidiaBase);
+  const nvidiaProxy = (document.getElementById('nvidiaProxy').value || '').trim();
+  localStorage.setItem('agent_nvidia_proxy', nvidiaProxy);
   localStorage.setItem('agent_nvidia_show_thinking', document.getElementById('nvidiaShowThinking').checked.toString());
   localStorage.setItem('agent_nvidia_stream', document.getElementById('nvidiaStream').checked.toString());
   document.dispatchEvent(new CustomEvent('settings:saved'));
@@ -6070,6 +6082,7 @@ function loadSettings() {
   // NVIDIA NIM settings
   const savedNvidiaBase = localStorage.getItem('agent_nvidia_base') || 'https://integrate.api.nvidia.com/v1';
   document.getElementById('nvidiaBase').value = savedNvidiaBase;
+  document.getElementById('nvidiaProxy').value = localStorage.getItem('agent_nvidia_proxy') || '';
   document.getElementById('nvidiaShowThinking').checked = localStorage.getItem('agent_nvidia_show_thinking') !== 'false';
   document.getElementById('nvidiaStream').checked = localStorage.getItem('agent_nvidia_stream') === 'true';
   if (!isPuter) {
@@ -6206,6 +6219,7 @@ document.getElementById('deepseekTestBtn').addEventListener('click', async () =>
 
 // ═══════════ NVIDIA NIM — обработчики ═══════════
 document.getElementById('nvidiaBase').addEventListener('change', () => { saveSettings(); });
+document.getElementById('nvidiaProxy').addEventListener('change', () => { saveSettings(); });
 document.getElementById('nvidiaShowThinking').addEventListener('change', saveSettings);
 document.getElementById('nvidiaStream').addEventListener('change', saveSettings);
 document.getElementById('nvidiaTestBtn').addEventListener('click', async () => {
@@ -6216,7 +6230,7 @@ document.getElementById('nvidiaTestBtn').addEventListener('click', async () => {
   if (!base) { statusEl.textContent = '⚠ Укажите Base URL'; statusEl.style.color = 'var(--warning)'; return; }
   statusEl.textContent = '⏳ Проверка...'; statusEl.style.color = 'var(--text-2)';
   try {
-    const res = await fetch(base + '/models', {
+    const res = await nvidiaProxiedFetch(base + '/models', {
       headers: { 'Authorization': 'Bearer ' + key, 'Accept': 'application/json' },
       signal: AbortSignal.timeout(8000),
     });
@@ -6757,13 +6771,13 @@ async function loadModels() {
         { id: 'glm-4.5-air', name: 'GLM-4.5-Air (128K)', context: 128000 },
         { id: 'glm-4-32b-0414-128k', name: 'GLM-4-32B-0414 (128K)', context: 128000 },
       ];
-    // ⭐ NVIDIA NIM: пробуем /models с nvapi-ключом, при ошибке — встроенный куратированный список
+    // ⭐ NVIDIA NIM: пробуем /models через прокси (если задан) с nvapi-ключом, при ошибке — встроенный куратированный список
     } else if (provider === 'nvidia') {
       const nvBase = getNvidiaBase();
       // Пробуем живой эндпоинт (нужен валидный ключ)
       try {
         if (key) {
-          const nvRes = await fetch(nvBase + '/models', {
+          const nvRes = await nvidiaProxiedFetch(nvBase + '/models', {
             headers: { 'Authorization': 'Bearer ' + key, 'Accept': 'application/json' },
             signal: AbortSignal.timeout(8000),
           });
@@ -10718,6 +10732,27 @@ function getNvidiaBase() {
   return raw.replace(/\/+$/, '');
 }
 
+/** Получить URL CORS-прокси для NVIDIA (без хвостовых слешей). */
+function getNvidiaProxy() {
+  return (localStorage.getItem('agent_nvidia_proxy') || '').trim();
+}
+
+/**
+ * Обёртка над fetch с поддержкой CORS-прокси для NVIDIA NIM.
+ * Если прокси задан — подставляет его перед URL.
+ * Формат прокси: "https://corsproxy.io/?" → finalUrl = proxy + encodeURIComponent(url)
+ *                "https://my.proxy/"       → finalUrl = proxy + url
+ */
+async function nvidiaProxiedFetch(url, options = {}) {
+  const proxy = getNvidiaProxy();
+  if (!proxy) return fetch(url, options);
+  // corsproxy.io и аналоги ожидают закодированный URL после знака "?"
+  const finalUrl = proxy.endsWith('?')
+    ? proxy + encodeURIComponent(url)
+    : proxy.replace(/\/?$/, '/') + url;
+  return fetch(finalUrl, options);
+}
+
 /* ========= Qwen AI Kit — полная интеграция API ========= */
 
 /** Получить базовый URL Qwen API */
@@ -11257,7 +11292,7 @@ async function callNvidia(model, key, messages, tools, temperature, signalOverri
 
   let res;
   try {
-    res = await fetch(endpoint, {
+    res = await nvidiaProxiedFetch(endpoint, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -11272,7 +11307,7 @@ async function callNvidia(model, key, messages, tools, temperature, signalOverri
     if (netErr.name === 'TypeError' || (netErr.message || '').includes('fetch')) {
       throw new Error(
         `NVIDIA NIM недоступен по адресу ${base}. ` +
-        `Проверьте Base URL и сетевое соединение.`
+        `Проверьте Base URL, CORS-прокси и сетевое соединение.`
       );
     }
     throw netErr;
