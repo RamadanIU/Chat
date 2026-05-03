@@ -19,7 +19,14 @@ import http from 'node:http';
 
 const PORT = Number(process.env.AGENT_PRO_BRIDGE_PORT || 7777);
 const HOST = process.env.AGENT_PRO_BRIDGE_HOST || '127.0.0.1';
-const VERSION = '1.0.0';
+const VERSION = '1.1.0';
+
+// WebSocket keepalive. Без этих ping'ов TCP-сокет может «тихо умереть»
+// от idle-timeout'ов NAT/прокси/мобильных операторов: обе стороны считают
+// соединение открытым, но трафик уже не ходит. Браузерный WebSocket сам
+// автоматически отвечает pong'ом на серверные ping-фреймы, так что от
+// frontend-кода ничего не требуется.
+const HEARTBEAT_INTERVAL_MS = Number(process.env.AGENT_PRO_BRIDGE_PING_MS || 25_000);
 
 const httpServer = http.createServer((req, res) => {
   // CORS для health-check из браузера
@@ -38,11 +45,29 @@ const httpServer = http.createServer((req, res) => {
 
 const wss = new WebSocketServer({ server: httpServer });
 
+// Каждые HEARTBEAT_INTERVAL_MS шлём ping всем клиентам. Если на предыдущий
+// ping не пришёл pong (isAlive остался false) — рвём соединение через
+// terminate(): close() ждал бы close-handshake, который уже не дойдёт.
+const heartbeatTimer = setInterval(() => {
+  for (const ws of wss.clients) {
+    if (ws.isAlive === false) {
+      try { ws.terminate(); } catch {}
+      continue;
+    }
+    ws.isAlive = false;
+    try { ws.ping(); } catch {}
+  }
+}, HEARTBEAT_INTERVAL_MS);
+wss.on('close', () => { clearInterval(heartbeatTimer); });
+
 wss.on('connection', (ws, req) => {
   const remoteAddr = req.socket.remoteAddress;
   console.log(`[bridge] connection from ${remoteAddr}`);
   let proc = null;
   let stdoutBuf = '';
+
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
 
   const sendJson = (obj) => { try { ws.send(JSON.stringify(obj)); } catch {} };
 
@@ -127,4 +152,5 @@ httpServer.listen(PORT, HOST, () => {
   console.log(`agent-pro-bridge ${VERSION} listening on http://${HOST}:${PORT}`);
   console.log(`  WebSocket: ws://${HOST}:${PORT}`);
   console.log(`  Health:    http://${HOST}:${PORT}/health`);
+  console.log(`  Heartbeat: ping every ${HEARTBEAT_INTERVAL_MS} ms`);
 });

@@ -9587,7 +9587,15 @@ class MCPClient {
       else p.resolve(msg.result);
       return;
     }
-    // notifications от сервера — пока просто логируем
+    // Уведомления от сервера: tools/list_changed → перечитываем тулы без
+    // полного реконнекта, чтобы они не пропадали из промта.
+    if (msg && typeof msg.method === 'string') {
+      if (msg.method === 'notifications/tools/list_changed') {
+        try { this.onToolsChanged && this.onToolsChanged(); } catch {}
+        return;
+      }
+    }
+    // прочие notifications от сервера — пока просто логируем
   }
 
   async connect() {
@@ -9656,10 +9664,23 @@ class MCPClient {
         }
       };
       ws.onerror = (e) => {
-        if (!opened) reject(new Error('WS connect error: ' + (e.message || 'unknown')));
+        if (!opened) {
+          reject(new Error('WS connect error: ' + (e.message || 'unknown')));
+        } else {
+          // Сетевая ошибка после успешного open. Сам по себе onerror соединение
+          // не закрывает (это сделает следом onclose), но без этого лога фронт
+          // молча проглатывал любые сетевые сбои.
+          this._log('in', { _ws_error: String(e.message || e.type || 'unknown') });
+        }
       };
       ws.onclose = () => {
         this._ws = null;
+        // Отклоняем все висящие запросы сразу. Иначе они ждут до 30 сек
+        // таймаута, и UI выглядит «зависшим», когда сокет уже мёртв.
+        for (const [, p] of this._pending) {
+          try { p.reject(new Error('MCP WS closed')); } catch {}
+        }
+        this._pending.clear();
         this.onClose();
       };
       ws.onmessage = (ev) => {
@@ -9740,7 +9761,8 @@ const MCPRegistry = {
         config: s.config,
         enabled: s.enabled !== false,
         disabledTools: new Set(s.disabledTools || []),
-        client: null, status: 'disconnected', tools: [], error: null
+        client: null, status: 'disconnected', tools: [], error: null,
+        _reconnectTimer: null, _reconnectAttempts: 0, _stopped: false
       }));
     } catch { this.servers = []; }
   },
@@ -9755,7 +9777,7 @@ const MCPRegistry = {
 
   async addServer(config) {
     const id = 'mcp_' + Math.random().toString(36).slice(2, 10);
-    const server = { id, config, enabled: true, disabledTools: new Set(), client: null, status: 'disconnected', tools: [], error: null };
+    const server = { id, config, enabled: true, disabledTools: new Set(), client: null, status: 'disconnected', tools: [], error: null, _reconnectTimer: null, _reconnectAttempts: 0, _stopped: false };
     this.servers.push(server);
     this.save();
     this._emit();
@@ -9767,7 +9789,11 @@ const MCPRegistry = {
 
   async removeServer(id) {
     const s = this.servers.find(x => x.id === id);
-    if (s && s.client) { try { s.client.close(); } catch {} }
+    if (s) {
+      s._stopped = true;
+      if (s._reconnectTimer) { clearTimeout(s._reconnectTimer); s._reconnectTimer = null; }
+      if (s.client) { try { s.client.close(); } catch {} }
+    }
     this.servers = this.servers.filter(x => x.id !== id);
     this.save();
     this._emit();
@@ -9779,12 +9805,36 @@ const MCPRegistry = {
     s.enabled = enabled;
     this.save();
     if (enabled) {
+      s._stopped = false;
+      s._reconnectAttempts = 0;
       try { await this.connect(id); } catch {}
-    } else if (s.client) {
-      try { s.client.close(); } catch {}
-      s.client = null; s.status = 'disconnected'; s.tools = [];
+    } else {
+      s._stopped = true;
+      if (s._reconnectTimer) { clearTimeout(s._reconnectTimer); s._reconnectTimer = null; }
+      if (s.client) {
+        try { s.client.close(); } catch {}
+        s.client = null; s.status = 'disconnected'; s.tools = [];
+      }
     }
     this._emit();
+  },
+
+  /**
+   * Планирует переподключение сервера с экспоненциальным backoff.
+   * Серия задержек: 0.5s → 1 → 2 → 4 → 8 → 16 → 30 (потолок).
+   * Сбрасывается при успешном connect и при manual stop.
+   */
+  _scheduleReconnect(s) {
+    if (!s || !s.enabled || s._stopped) return;
+    if (s._reconnectTimer) return;
+    const attempt = s._reconnectAttempts || 0;
+    s._reconnectAttempts = attempt + 1;
+    const delay = Math.min(30_000, 500 * Math.pow(2, attempt));
+    s._reconnectTimer = setTimeout(() => {
+      s._reconnectTimer = null;
+      if (s._stopped || !s.enabled) return;
+      this.connect(s.id).catch(() => {});
+    }, delay);
   },
 
   toggleTool(serverId, toolName, enabled) {
@@ -9799,6 +9849,9 @@ const MCPRegistry = {
   async connect(id) {
     const s = this.servers.find(x => x.id === id);
     if (!s) return;
+    // Отменяем любой запланированный реконнект — ручной/новый connect его перебивает.
+    if (s._reconnectTimer) { clearTimeout(s._reconnectTimer); s._reconnectTimer = null; }
+    s._stopped = false;
     if (s.client) { try { s.client.close(); } catch {} s.client = null; }
     const client = new MCPClient(s.config, {
       onLog: (entry) => {
@@ -9811,7 +9864,18 @@ const MCPRegistry = {
           s.status = 'disconnected';
           s.client = null;
           this._emit();
+          // Автоматически пробуем переподнять — без этого тулы исчезают
+          // из промта при любом TCP-разрыве и не возвращаются до ручного клика.
+          this._scheduleReconnect(s);
         }
+      },
+      onToolsChanged: async () => {
+        if (s.client !== client) return;
+        try {
+          await client.refreshTools();
+          s.tools = client.tools;
+          this._emit();
+        } catch {}
       }
     });
     s.client = client;
@@ -9823,10 +9887,13 @@ const MCPRegistry = {
       s.status = 'ready';
       s.tools = client.tools;
       s.error = null;
+      s._reconnectAttempts = 0;
     } catch (e) {
       s.status = 'error';
       s.error = String(e.message || e);
       s.tools = [];
+      // client.connect() при ошибке вызывает client.close() → onClose →
+      // _scheduleReconnect; явно второй раз планировать не нужно.
     }
     this._emit();
   },
@@ -9836,6 +9903,37 @@ const MCPRegistry = {
     this.bridgeAvailable = checks.available;
     this._emit();
     await Promise.all(this.servers.filter(s => s.enabled).map(s => this.connect(s.id).catch(() => {})));
+  },
+
+  /**
+   * Периодически опрашивает /health моста. Делает две вещи:
+   *  1) держит индикатор «Локальный мост (stdio): подключён» актуальным
+   *     даже если мост рестартанул в середине сессии (run.py supervisor
+   *     поднимает его сам, но раньше frontend об этом не узнавал);
+   *  2) при возврате моста (unavailable → available) автоматически поднимает
+   *     stdio-серверы, которые лежали в disconnected/error.
+   */
+  startBridgeHealthMonitor(intervalMs = 15_000) {
+    if (this._healthTimer) return;
+    const tick = async () => {
+      let available = false;
+      try { available = (await checkMCPBridge()).available; } catch { available = false; }
+      const wasAvailable = this.bridgeAvailable;
+      if (wasAvailable !== available) {
+        this.bridgeAvailable = available;
+        this._emit();
+      }
+      if (available && !wasAvailable) {
+        for (const s of this.servers) {
+          if (!s.enabled || s._stopped) continue;
+          if (s.config && s.config.transport !== 'stdio') continue;
+          if (s.status === 'ready' || s.status === 'connecting') continue;
+          if (s._reconnectTimer) continue;
+          this.connect(s.id).catch(() => {});
+        }
+      }
+    };
+    this._healthTimer = setInterval(tick, intervalMs);
   },
 
   /** Имя инструмента для модели: mcp__<server>__<tool>. Безопасные символы. */
@@ -16895,9 +16993,12 @@ const MCPUI = (() => {
     MCPRegistry.load();
     MCPRegistry.on(rerender);
     rerender();
-    // Разовая проверка моста + connect всех включённых серверов.
-    // Переподключение — только вручную через «Reconnect All» / иконку у сервера.
+    // Стартовое подключение + автоматический мониторинг моста. При
+    // обрыве WebSocket'а каждый MCPClient теперь сам планирует реконнект
+    // через MCPRegistry._scheduleReconnect (exponential backoff), а
+    // health-monitor поднимает stdio-серверы после рестарта моста.
     MCPRegistry.connectAll().catch(() => {});
+    MCPRegistry.startBridgeHealthMonitor();
   }
 
   return { init, rerender };
