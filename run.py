@@ -326,6 +326,12 @@ def banner() -> None:
     else:
         log("system", "agent-browser  : НЕ установлен — browser_action будет падать.")
         log("system", "                 (поставьте через bash start.sh либо tools/agent-browser-termux/install.sh)")
+    ba = shutil.which("browser-act")
+    if ba:
+        log("system", f"BrowserAct CLI : {ba} (browser_act в чате готов)")
+    else:
+        log("system", "BrowserAct CLI : НЕ установлен — browser_act будет падать.")
+        log("system", "                 (поставьте через bash start.sh либо uv tool install browser-act-cli --python 3.12)")
     log("system", "─" * 64)
     if _AUTH_TOKEN is None:
         log("system", "Auth (frontend): ОТКЛЮЧЕНА (AUTH_DISABLE=1)")

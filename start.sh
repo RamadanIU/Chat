@@ -16,6 +16,7 @@
 #
 # Флаги (для foreground / start):
 #   --no-browser     не ставить agent-browser shim.
+#   --no-browser-act не ставить BrowserAct CLI.
 #   --skip-deps      пропустить установку зависимостей (только запуск).
 #
 # Что получаем после запуска:
@@ -24,6 +25,7 @@
 #   • Terminal Server (WebSocket)  ws://localhost:8765/term  |  /exec
 #   • MCP stdio Bridge             ws://127.0.0.1:7777
 #   • CLI agent-browser            (для browser_action в чате)
+#   • CLI browser-act              (BrowserAct: stealth/real Chrome/captcha/network)
 #
 # Логин/пароль на frontend (HTTP Basic Auth):
 #   AUTH_USER       (default Ramadan)
@@ -33,7 +35,8 @@
 # Прочие переменные окружения:
 #   FRONTEND_PORT, WORKSPACE_PORT, TERM_PORT, BRIDGE_PORT, HOST,
 #   TOKEN (terminal-server), WORKSPACE_DIR, AGENT_PRO_BRIDGE_HOST,
-#   PLAYWRIGHT_TERMUX_ROOT, AGENT_BROWSER_PORT.
+#   PLAYWRIGHT_TERMUX_ROOT, AGENT_BROWSER_PORT,
+#   AGENT_PRO_BROWSERACT_AUTO_UPGRADE (default 1).
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -55,6 +58,7 @@ mkdir -p "${RUN_DIR}"
 # ── Парсинг команды и флагов ─────────────────────────────────────────────────
 CMD="run"
 WITH_BROWSER=1
+WITH_BROWSER_ACT=1
 SKIP_DEPS=0
 PASSTHROUGH=()
 
@@ -66,8 +70,9 @@ fi
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --no-browser) WITH_BROWSER=0; shift ;;
-    --skip-deps)  SKIP_DEPS=1;    shift ;;
+    --no-browser)     WITH_BROWSER=0;     shift ;;
+    --no-browser-act) WITH_BROWSER_ACT=0; shift ;;
+    --skip-deps)      SKIP_DEPS=1;        shift ;;
     --help|-h)
       sed -n '2,38p' "$0"
       exit 0
@@ -228,6 +233,31 @@ install_deps() {
     ok "root node_modules OK"
   else
     ok "root node_modules уже установлены"
+  fi
+
+  # BrowserAct CLI (stealth/real Chrome/captcha/network browser automation)
+  if [ $WITH_BROWSER_ACT -eq 1 ]; then
+    local AUTO_UPGRADE
+    AUTO_UPGRADE="${AGENT_PRO_BROWSERACT_AUTO_UPGRADE:-1}"
+    if command -v uv >/dev/null 2>&1; then
+      if ! command -v browser-act >/dev/null 2>&1; then
+        info "ставлю BrowserAct CLI (browser-act-cli через uv)…"
+        uv tool install browser-act-cli --python 3.12
+        ok "BrowserAct CLI установлен"
+      elif [ "$AUTO_UPGRADE" != "0" ]; then
+        info "обновляю BrowserAct CLI (browser-act-cli через uv)…"
+        uv tool upgrade browser-act-cli || true
+        ok "BrowserAct CLI готов"
+      else
+        ok "BrowserAct CLI уже установлен ($(command -v browser-act))"
+      fi
+    else
+      warn "uv не найден — BrowserAct CLI не установлен."
+      [ $IS_TERMUX -eq 1 ] && echo "    Termux: pkg install -y uv  # или pip install --user uv" \
+                           || echo "    Ubuntu/Debian: curl -LsSf https://astral.sh/uv/install.sh | sh"
+    fi
+  else
+    warn "--no-browser-act: пропускаю установку BrowserAct CLI."
   fi
 
   # Node deps (bridge)

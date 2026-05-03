@@ -9,6 +9,7 @@
 | **Terminal Server** (`server.js`, Node + node-pty) | Удалённый PTY и одноразовые команды для агента | `ws://localhost:8765/term`, `ws://localhost:8765/exec` |
 | **MCP stdio Bridge** (`bridge/agent-pro-bridge.mjs`) | Локальный мост, чтобы браузер мог запускать stdio-MCP-серверы | `ws://127.0.0.1:7777` |
 | **agent-browser** (CLI, `tools/agent-browser-termux/`) | Persistent Playwright-Chromium для `browser_action` в чате | `~/.local/bin/agent-browser` (или `$PREFIX/bin` на Termux) |
+| **BrowserAct** (`browser-act-cli`) | Stealth/Real Chrome/CAPTCHA/network browser automation для `browser_act` и встроенного skill `browser-act` | `~/.local/bin/browser-act` |
 
 Раньше эти процессы нужно было запускать руками в разных терминалах, плюс отдельно
 ставить agent-browser shim. Теперь после клона репозитория всё стартует **одной
@@ -27,6 +28,9 @@
 * **Chromium** или **Google Chrome** в `$PATH` (нужен для `agent-browser`; на Ubuntu —
   `sudo apt install chromium-browser`, на Termux — `pkg install chromium-browser`).
   Без него все остальные сервисы поднимутся, но `browser_action` в чате будет падать.
+* **uv** для автоматической установки BrowserAct CLI (`browser-act-cli`). Если `uv`
+  отсутствует, стек запустится, но инструмент `browser_act` будет недоступен до
+  `uv tool install browser-act-cli --python 3.12`.
 
 ```bash
 git clone https://github.com/RamadanIU/Chat.git
@@ -52,17 +56,49 @@ npm start
    создаст `~/playwright-termux/`, поставит туда `playwright-core`, разложит
    `daemon.js` / `cli.js` и положит обёртку `agent-browser` в `~/.local/bin`.
    Этот шаг можно отключить флагом `--no-browser`.
-5. Запустит **все четыре сервиса** через оркестратор `run.py`.
+5. Установит/обновит **BrowserAct CLI** (`browser-act-cli`) для встроенного
+   инструмента `browser_act` и skill `browser-act`.
+6. Запустит **все четыре сервиса** через оркестратор `run.py`.
 
 ### Флаги
 
 * `bash start.sh --no-browser` — пропустить установку agent-browser shim
   (если в чате не нужен `browser_action`).
+* `bash start.sh --no-browser-act` — пропустить установку BrowserAct CLI
+  (если в чате не нужен `browser_act` / `browser-act` skill).
 * `bash start.sh --skip-deps` — не ставить ничего, только запустить (после
   первой успешной установки).
 * `bash start.sh --help` — показать встроенную справку.
 
 После запуска откройте в браузере <http://localhost:8080> — это и есть UI чата.
+
+### BrowserAct в Agent Pro
+
+BrowserAct интегрирован как нативный инструмент `browser_act` и встроенный
+включённый skill `browser-act`. Агент выбирает его для BrowserAct-задач, сайтов с
+anti-bot/Cloudflare/CAPTCHA, stealth/proxy/private-mode сценариев, Real Chrome
+сессий, сетевой диагностики, cookies/dialogs/HAR и точного извлечения
+rendered-контента.
+
+Базовый цикл BrowserAct внутри чата:
+
+```text
+browser_act(command: "browser real open https://example.com")
+browser_act(command: "state", format: "json")
+browser_act(command: "click 5")
+browser_act(command: "wait stable && state")
+browser_act(command: "get markdown")
+```
+
+Для stealth-браузера:
+
+```text
+browser_act(command: "browser create work --dynamic-proxy US")
+browser_act(command: "browser open <browser_id> https://example.com")
+```
+
+Скриншоты BrowserAct автоматически попадают во вкладку Browser Agent рядом с
+обычным `browser_action`.
 Завершить всё — `Ctrl+C` в том же терминале.
 
 > **Закрытие окна терминала не убивает сервисы** даже в foreground-режиме:

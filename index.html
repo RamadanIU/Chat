@@ -8444,6 +8444,10 @@ function escapeHtml(text) {
   div.textContent = text;
   return div.innerHTML;
 }
+
+function shellQuote(s) {
+  return "'" + String(s ?? '').replace(/'/g, "'\\''") + "'";
+}
 /* ========= Управление встроенными инструментами (Tools toggle) ========= */
 const disabledBuiltinTools = new Set(
   JSON.parse(localStorage.getItem('agent_disabled_builtin_tools') || '[]')
@@ -8778,6 +8782,24 @@ const toolDefs = [
   {
     type: 'function',
     function: {
+      name: 'browser_act',
+      description: 'Control BrowserAct CLI (`browser-act`) as a first-class browser automation engine. Use this when the user explicitly asks for BrowserAct/browser-act, when a site has bot detection/Cloudflare/CAPTCHA, when stealth/proxy/private mode is needed, when you need Real Chrome login sessions, when scraping/extracting rendered content, or when network/HAR/cookies/dialog tooling is needed.\n\nBrowserAct workflows:\n- Fast extraction: command="stealth-extract https://example.com" (standalone rendered markdown/html extraction).\n- Real Chrome: command="browser real open https://example.com" or "browser real open https://example.com --ba-kernel".\n- Stealth: command="browser create work --dynamic-proxy US", then "browser open <browser_id> https://example.com".\n- Inspect: command="state" returns URL/title/clickable element indexes.\n- Interact by index: "click 5", "input 3 text", "select 4 option", "keys Enter", "scroll down --amount 1000", "upload 7 /abs/file".\n- Verify after changes: "wait stable && state" or "screenshot /abs/path.png".\n- Data: "get markdown", "get html", "get text 2", "eval document.title".\n- Network/HAR: "network requests", "network request <id>", "network har start", "network har stop /abs/trace.har".\n- Dialog/captcha/cookies/tabs: "dialog status|accept|dismiss", "solve-captcha", "cookies get|set|clear|export|import", "tab list|switch|close".\n\nRules: after any navigation/click/form submit, run wait stable then state before using new indexes. If credentials/MFA/payment confirmation/human review are needed and not already provided, stop and request human assist via command="human-assist-url --objective \\"...\\"". If solve-captcha fails, request human assist. Do not delete BrowserAct browsers or clear profiles without user confirmation.',
+      parameters: {
+        type: 'object',
+        properties: {
+          command: { type: 'string', description: 'browser-act command WITHOUT the `browser-act` prefix. Examples: "stealth-extract https://example.com", "browser real open https://example.com --ba-kernel", "state", "click 5", "input 3 hello", "wait stable && state", "solve-captcha".' },
+          session: { type: 'string', description: 'Optional BrowserAct session name. Use separate sessions for parallel or isolated tasks. Defaults to "default".' },
+          format: { type: 'string', enum: ['text', 'json'], description: 'CLI output format. Use json when you need machine-readable state/network data.' },
+          intent: { type: 'string', description: 'Short intent passed to BrowserAct for auditability.' },
+          description: { type: 'string', description: 'Brief description shown in Agent Pro UI.' }
+        },
+        required: ['command']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
       name: 'browser_action',
       description: 'Control a headless browser via agent-browser. Use for: web scraping, FORM FILLING (e.g. submitting university applications), uploading documents, UI testing, screenshot capture, navigating sites. The browser runs on the remote server with full internet access and a persistent session (cookies/login survive between calls).\n\nCommands:\n- open <url> [--wait load|domcontentloaded|networkidle]\n- back | forward | reload\n- snapshot -i — Get interactive elements with @e-refs (USE THIS FIRST after open)\n- click <selector|@ref> | dblclick | hover | focus\n- fill <selector|@ref> <text> — Clear and type text\n- type <selector|@ref> <text> [--delay ms] — Append text\n- press [<selector|@ref>] <key> — Enter, Tab, Escape, ArrowDown, etc.\n- upload <selector|@ref> <path> — Attach file to <input type=file>. Use ABSOLUTE paths or ~/path.\n- screenshot <path> [--full] [--clip x,y,w,h]\n- eval <js> | eval -b <base64-js> — Run JS in page; result printed as JSON\n- get url | get title | get text [<selector>] | get html [<selector>]\n- wait <selector|@ref> [timeout-ms] | wait timeout <ms> | wait load|domcontentloaded|networkidle\n- set viewport <w> <h>\n- tabs list | tabs new [url] | tabs switch <i> | tabs close <i>\n- cookies get [domain] | cookies clear\n- mouse move <x> <y> | mouse click <x> <y> | mouse wheel <dy>\n\nWORKFLOW for forms / document submission (e.g. university applications):\n1. open <url>\n2. snapshot -i — read the @e-refs and identify the right textbox/button/file inputs\n3. fill @eN <text> for each input field\n4. upload @eM <file-path> for file inputs (look for [file] tag in snapshot)\n5. click @eK on the submit button\n6. screenshot to verify result, or get text to extract confirmation\n\nSelectors: standard CSS, role=button[name="..."], text="...", or @e1/@e2 refs from snapshot.',
       parameters: {
@@ -8889,9 +8911,12 @@ const toolImpl = {
     if (!skill) {
       return { error: `Skill "${skill_name}" not found or disabled.` };
     }
+    const instructions = (typeof SkillsEngine !== 'undefined' && SkillsEngine.normalizeSkillContent)
+      ? SkillsEngine.normalizeSkillContent(skill.content)
+      : skill.content;
     return {
       skill_name: skill.name,
-      instructions: skill.content,
+      instructions,
       note: 'Follow these instructions strictly for the current task.'
     };
   },
@@ -9236,6 +9261,58 @@ const toolImpl = {
     } catch (e) {
       BrowserPanel.setWorking(false);
       return { error: `Browser error: ${e.message}`, exit_code: 1 };
+    }
+  },
+
+  async browser_act({ command = '', session = 'default', format = 'text', intent = '', description = '' } = {}) {
+    if (!command.trim()) return { error: 'No BrowserAct command specified', exit_code: 1 };
+    const host = localStorage.getItem('agent_term_host') || '';
+    if (!host) return { error: 'Терминал-сервер не настроен. Укажите URL в настройках → Терминал.', exit_code: 1 };
+
+    const unsafeDestructive = /^\s*browser\s+(delete|clear-profile)\b/i.test(command);
+    const unsafeCookieClear = /^\s*cookies\s+clear\b/i.test(command);
+    if (unsafeDestructive || unsafeCookieClear) {
+      return {
+        error: 'Нужна явная команда пользователя: BrowserAct delete/clear-profile/cookies clear удаляет сохранённое состояние.',
+        exit_code: 2
+      };
+    }
+
+    const wsRoot = (typeof VFS !== 'undefined' && VFS.isServerMode())
+      ? (VFS.getWorkspaceDir() || '~/workspace')
+      : '~/workspace';
+    const shellWsRoot = wsRoot.replace(/(["\\$`])/g, '\\$1');
+    const SCREEN_PATH = `${shellWsRoot}/browser/browser-act.png`;
+
+    BrowserPanel.setWorking(true, description || command);
+    BrowserPanel.addAction('browser-act ' + command);
+
+    try {
+      await TermEngine.execAgentCommand(`mkdir -p "${shellWsRoot}/browser"`);
+      const parts = ['browser-act'];
+      if (session && String(session).trim()) parts.push('--session', shellQuote(String(session).trim()));
+      if (format === 'json') parts.push('--format', 'json');
+      if (intent && String(intent).trim()) parts.push('--intent', shellQuote(String(intent).trim()));
+      const trimmedCommand = command.trim();
+      if (/^\s*browser-act\b/.test(trimmedCommand)) {
+        return { error: 'Передайте команду без префикса `browser-act`.', exit_code: 2 };
+      }
+      parts.push(trimmedCommand);
+      const result = await TermEngine.execAgentCommand(parts.join(' '));
+
+      try {
+        await TermEngine.execAgentCommand(`browser-act --session ${shellQuote(String(session || 'default'))} screenshot ${SCREEN_PATH}`);
+        await TermEngine.execAgentCommand(`cp "${SCREEN_PATH}" "${shellWsRoot}/browser/screen.png" 2>/dev/null || true`);
+        const urlRes = await TermEngine.execAgentCommand(`browser-act --session ${shellQuote(String(session || 'default'))} eval 'location.href' 2>/dev/null`);
+        if (urlRes?.stdout?.trim()) BrowserPanel.setUrl(urlRes.stdout.trim().replace(/^["']|["']$/g, ''));
+        await BrowserPanel.loadScreenshot();
+      } catch(_) {}
+
+      BrowserPanel.setWorking(false);
+      return result;
+    } catch (e) {
+      BrowserPanel.setWorking(false);
+      return { error: `BrowserAct error: ${e.message}`, exit_code: 1 };
     }
   },
 
@@ -12251,8 +12328,17 @@ Execution:
   3. fill @eN <text> for each field. Use upload @eM <path> for file inputs (marked [file] in snapshot).
   4. click @eK on the submit button.
   5. screenshot or get text/url to verify.
-  Key commands: open, back, forward, reload, snapshot -i, click, fill, type, press, upload, screenshot, eval, wait, get url|title|text|html, set viewport, tabs new|list|switch|close, cookies, hover, mouse move|click|wheel.
-  ALWAYS use "open <url>" first, then "snapshot -i" to discover interactive elements. Use refs (@e1, @e2...) from snapshot — they're more reliable than CSS selectors. For uploads, write the file to a known path first via run_terminal under <WORKSPACE>/browser/uploads/<filename> (the WORKSPACE INFO block below tells you the exact path), then upload @eN <full-path>.
+- browser_act(command, session?, format?, intent?, description?) — control BrowserAct CLI. This is the preferred browser engine when the user says BrowserAct/browser-act, when a site has anti-bot protection/Cloudflare/CAPTCHA, when stealth/proxy/private mode is needed, when you need Real Chrome login sessions, or when you need rendered extraction/network/HAR/cookies/dialog tooling.
+  BrowserAct core workflow:
+  1. Open: browser_act(command: "browser real open https://example.com") for existing Chrome/session, or create/open a stealth browser with "browser create <name> [--dynamic-proxy US|--custom-proxy ...|--mode private]" then "browser open <browser_id> <url>".
+  2. Inspect: browser_act(command: "state") to get current URL/title and clickable element indexes.
+  3. Interact by index: "click 5", "input 3 text", "select 4 option", "keys Enter", "scroll down --amount 1000", "upload 7 /absolute/file".
+  4. Verify after every navigation/click/form submit: "wait stable && state" or "screenshot /absolute/path.png". Old indexes become invalid after page changes.
+  5. Extract: "stealth-extract <url>", "get markdown", "get html", "get text <index>", "eval document.title".
+  6. Advanced: "solve-captcha"; "network requests", "network request <id>", "network har start/stop"; "cookies get/set/export/import"; "dialog status/accept/dismiss"; "tab list/switch/close".
+  Policies: if credentials/MFA/payment confirmation/human page review are needed and were not provided, call browser_act(command: "human-assist-url --objective \"...\"") and wait for the user. If solve-captcha fails, request human assist. Never delete BrowserAct browsers, clear profiles, or clear cookies unless the user explicitly asked.
+  Key BrowserAct commands: browser real open, browser create/open/list/update, stealth-extract, state, click, input, select, keys, scroll, upload, screenshot, eval, wait stable, get markdown|html|text|value, tab list|switch|close, cookies, dialog, network, solve-captcha.
+  Always open a page first, then run state to discover element indexes. Use fresh indexes from the latest state. For uploads, write the file to a known path first via run_terminal under <WORKSPACE>/browser/uploads/<filename> (the WORKSPACE INFO block below tells you the exact path), then upload <index> <full-path>.
 - run_project(build?, serve, port, url?) — FULL BUILD PIPELINE. Runs build command via terminal, starts the serve command in background, waits for the server to be ready, then opens a live preview iframe. The server hostname is auto-detected from terminal server settings.
   Examples:
   • React/Vite prod:  build="npm install && npm run build", serve="npx serve dist -l {port}", port=3000
@@ -13047,6 +13133,10 @@ function humanizeToolCall(name, args) {
   if (name === 'browser_action') {
     const desc = args.description || args.command || '';
     return ic('globe') + desc;
+  }
+  if (name === 'browser_act') {
+    const desc = args.description || args.command || '';
+    return ic('shield') + 'BrowserAct: ' + desc;
   }
   if (name === 'delegate_task') {
     return ic('share-2') + 'Делегирование: ' + (args.step_title || 'подзадача');
@@ -15248,7 +15338,8 @@ const BrowserPanel = (() => {
     entry.className = 'browser-action-entry';
     const cmd = cmdText.toLowerCase().trim();
     let icon = 'zap';
-    if (cmd.startsWith('open')) icon = 'globe';
+    if (cmd.startsWith('browser-act')) icon = 'shield';
+    else if (cmd.startsWith('open')) icon = 'globe';
     else if (cmd.startsWith('click')) icon = 'mouse-pointer';
     else if (cmd.startsWith('type') || cmd.startsWith('fill')) icon = 'keyboard';
     else if (cmd.startsWith('screenshot')) icon = 'camera';
@@ -16540,7 +16631,7 @@ const SkillsEngine = (() => {
     const active = skills.filter(s => s.enabled && s.content && s.content.trim());
     if (!active.length) return '';
     return '\n\n--- CUSTOM SKILLS ---\n' +
-      active.map(s => `[${s.name}]\n${s.content.trim()}`).join('\n\n') +
+      active.map(s => `[${s.name}]\n${normalizeSkillContent(s.content).trim()}`).join('\n\n') +
       '\n--- END CUSTOM SKILLS ---';
   }
 
@@ -16627,7 +16718,7 @@ const SkillsEngine = (() => {
       const newContent = item.querySelector('.skill-item-textarea').value.trim();
       const newName = item.querySelector('[data-name-input]').value.trim();
       if (!newName) { alert('Введите название скила'); return; }
-      s[idx].content = newContent;
+      s[idx].content = normalizeSkillContent(newContent);
       s[idx].name = newName;
       save(s);
       render();
@@ -16670,6 +16761,7 @@ const SkillsEngine = (() => {
   }
 
   function init() {
+    seedBuiltinSkills();
     updateBadge();
 
     document.getElementById('openSkillsBtn')?.addEventListener('click', () => {
@@ -16691,7 +16783,7 @@ const SkillsEngine = (() => {
       const nameEl = document.getElementById('newSkillName');
       const contentEl = document.getElementById('newSkillContent');
       const name = nameEl.value.trim();
-      const content = contentEl.value.trim();
+      const content = normalizeSkillContent(contentEl.value.trim());
       if (!name) { nameEl.focus(); nameEl.style.borderColor = 'var(--error)'; setTimeout(() => nameEl.style.borderColor = '', 1200); return; }
       if (!content) { contentEl.focus(); contentEl.style.borderColor = 'var(--error)'; setTimeout(() => contentEl.style.borderColor = '', 1200); return; }
       const skills = load();
@@ -16709,7 +16801,61 @@ const SkillsEngine = (() => {
     });
   }
 
-  return { init, load, save, getActivePrompt, getSkillsListPrompt, updateBadge, render };
+  function normalizeSkillContent(content) {
+    const text = String(content || '').trim();
+    const m = text.match(/^---\s*\n[\s\S]*?\n---\s*\n?/);
+    return m ? text.slice(m[0].length).trim() : text;
+  }
+
+  function seedBuiltinSkills() {
+    const skills = load();
+    const now = Date.now();
+    const builtins = [{
+      id: 'builtin-browser-act',
+      name: 'browser-act',
+      enabled: true,
+      content: `# BrowserAct
+
+Use BrowserAct when the user says BrowserAct/browser-act, or when the task needs browser automation with stealth, CAPTCHA solving, proxy/private mode, Real Chrome sessions, rendered extraction, network/HAR inspection, cookies, dialogs, or reliable scraping.
+
+Install/runtime: \`browser-act\` is provided by \`browser-act-cli\` and installed by Agent Pro start.sh via \`uv tool install browser-act-cli --python 3.12\`.
+
+Core loop:
+1. Open:
+   - Quick extraction: browser_act(command: "stealth-extract https://example.com")
+   - Real Chrome/login session: browser_act(command: "browser real open https://example.com")
+   - Stealth: browser_act(command: "browser create work --dynamic-proxy US") then browser_act(command: "browser open <browser_id> https://example.com")
+2. Inspect: browser_act(command: "state", format: "json") or text state.
+3. Interact using current indexes: click <index>, input <index> <text>, select <index> <option>, keys Enter, scroll down --amount 1000, upload <index> /absolute/file.
+4. Verify after every page-changing action: browser_act(command: "wait stable && state"). Old indexes are stale after navigation/click/submit.
+5. Extract/inspect: get markdown, get html, get text <index>, eval <js>, screenshot /absolute/path.png.
+6. Advanced: solve-captcha; network requests/request/clear/offline/har start/har stop; cookies get/set/export/import; dialog status/accept/dismiss; tab list/switch/close.
+
+Policies:
+- If credentials, MFA, payment confirmation, or visual page review are needed and not already provided, call browser_act(command: "human-assist-url --objective \\"Please complete/review ...\\"") and wait for the user before continuing.
+- If solve-captcha fails, request human assist.
+- Do not delete BrowserAct browsers, clear profiles, or clear cookies unless the user explicitly asked.
+- Prefer separate sessions for parallel work: browser_act(command: "...", session: "task-name").`
+    }];
+    let changed = false;
+    for (const builtin of builtins) {
+      const existing = skills.find(s => s.id === builtin.id || s.name === builtin.name);
+      if (!existing) {
+        skills.unshift({ ...builtin, createdAt: now, updatedAt: now });
+        changed = true;
+      } else if (!existing.content || existing.id === builtin.id) {
+        existing.id = builtin.id;
+        existing.name = builtin.name;
+        existing.content = existing.content || builtin.content;
+        existing.enabled = existing.enabled !== false;
+        existing.updatedAt = existing.updatedAt || now;
+        changed = true;
+      }
+    }
+    if (changed) save(skills);
+  }
+
+  return { init, load, save, getActivePrompt, getSkillsListPrompt, updateBadge, render, normalizeSkillContent, seedBuiltinSkills };
 })();
 
 document.addEventListener('DOMContentLoaded', () => SkillsEngine.init());
