@@ -17,6 +17,14 @@ Endpoints (workspace):
     GET  /ws/search?query=&...             — поиск по содержимому файлов
     POST /ws/reset                         — очистить рабочую область
 
+Endpoints (NVIDIA NIM reverse-proxy — для обхода CORS из браузера):
+    ANY  /nvidia/<path>                    — прозрачный реверс-прокси к
+                                              integrate.api.nvidia.com (или к
+                                              X-Nvidia-Base-Url из заголовка),
+                                              включая SSE-стриминг и tool calls.
+                                              Заменяет внешние CORS-прокси
+                                              вроде corsproxy.io.
+
 Endpoints (memory — БД-бэкенд для всего, что раньше жило в localStorage):
     GET  /mem/health                       — статус БД, счётчики
     GET  /mem/export                       — полный снэпшот (kv + чаты + скилы + MCP)
@@ -53,6 +61,12 @@ Endpoints (system — обновление установки):
     WORKSPACE_HOST      адрес для прослушивания (default: 0.0.0.0)
     WORKSPACE_PORT      порт (default: 8764)
     AGENT_PRO_MEMORY_DB путь к SQLite-файлу памяти (default: ~/.local/share/agent-pro/memory.db)
+    NVIDIA_BASE_URL     дефолтный upstream для /nvidia/<path>
+                        (default: https://integrate.api.nvidia.com/v1).
+                        Клиент может переопределить заголовком X-Nvidia-Base-Url.
+    NVIDIA_PROXY_TIMEOUT таймаут чтения upstream в секундах для /nvidia/<path>
+                        (default: 900). SSE может тянуться долго —
+                        ставьте побольше.
 """
 
 from __future__ import annotations
@@ -62,11 +76,15 @@ import base64
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 from typing import Iterable
+from urllib import error as _urllib_error
+from urllib import parse as _urllib_parse
+from urllib import request as _urllib_request
 
-from flask import Flask, abort, jsonify, request
+from flask import Flask, Response, abort, jsonify, request, stream_with_context
 from flask_cors import CORS
 
 from memory_db import MemoryDB
@@ -529,6 +547,205 @@ def reset():
         shutil.rmtree(BASE_DIR)
     os.makedirs(BASE_DIR, exist_ok=True)
     return jsonify({"ok": True})
+
+
+# ═══════════════════════ /nvidia/* — реверс-прокси к NVIDIA NIM ═══════════
+#
+# Браузер не может ходить напрямую в integrate.api.nvidia.com из index.html —
+# NVIDIA не отдаёт CORS-заголовки. Раньше для этого подключали внешние
+# CORS-прокси (corsproxy.io и аналоги), что приводит к утечке nvapi-ключа
+# на чужой сервер и зависимости от стороннего сервиса.
+#
+# Этот реверс-прокси решает обе проблемы: тот же origin, что и Workspace API
+# (CORS уже разрешён через flask-cors), запрос форвардится в NVIDIA как есть
+# (включая заголовок Authorization, тело и SSE-ответ).
+#
+# URL-схема:
+#     /nvidia/chat/completions       → ${BASE}/chat/completions
+#     /nvidia/models                 → ${BASE}/models
+# где BASE = X-Nvidia-Base-Url (заголовок из браузера) или $NVIDIA_BASE_URL
+# или https://integrate.api.nvidia.com/v1.
+
+NVIDIA_DEFAULT_BASE = "https://integrate.api.nvidia.com/v1"
+
+# Заголовки, которые НЕ форвардим в upstream:
+#   - hop-by-hop (Connection, TE, Upgrade, …) согласно RFC 7230;
+#   - служебные браузерные (Origin/Referer/Cookie) — NVIDIA их не ждёт;
+#   - наш собственный X-Nvidia-Base-Url — он управляет прокси, а не upstream.
+_NVIDIA_PROXY_SKIP_REQ_HEADERS = frozenset({
+    "host",
+    "content-length",
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailers",
+    "transfer-encoding",
+    "upgrade",
+    "x-nvidia-base-url",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-real-ip",
+    "origin",
+    "referer",
+    "cookie",
+})
+
+_NVIDIA_PROXY_SKIP_RESP_HEADERS = frozenset({
+    "connection",
+    "transfer-encoding",
+    "content-encoding",
+    "content-length",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailers",
+    "upgrade",
+    # Werkzeug пересоберёт CORS-заголовки сам через flask_cors, чтобы не
+    # дублировать их.
+    "access-control-allow-origin",
+    "access-control-allow-credentials",
+    "access-control-expose-headers",
+})
+
+
+def _nvidia_proxy_timeout() -> float:
+    raw = os.environ.get("NVIDIA_PROXY_TIMEOUT", "").strip()
+    try:
+        v = float(raw) if raw else 900.0
+    except ValueError:
+        v = 900.0
+    return v if v > 0 else 900.0
+
+
+def _nvidia_target_base() -> str:
+    """Куда форвардим: X-Nvidia-Base-Url > $NVIDIA_BASE_URL > default."""
+    base = (
+        request.headers.get("X-Nvidia-Base-Url")
+        or os.environ.get("NVIDIA_BASE_URL")
+        or NVIDIA_DEFAULT_BASE
+    ).strip()
+    return base.rstrip("/")
+
+
+@app.route(
+    "/nvidia/<path:subpath>",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+)
+def nvidia_proxy(subpath: str):
+    """Прозрачный реверс-прокси к NVIDIA NIM API.
+
+    Поддерживает SSE-стриминг: upstream-ответ читается чанками и сразу
+    отдаётся вниз по соединению, без буферизации всего тела.
+    """
+    # CORS-preflight закрывается flask_cors на уровне приложения. Этот хэндлер
+    # тоже отвечает 204, чтобы не ходить в upstream зря.
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    base = _nvidia_target_base()
+    parsed = _urllib_parse.urlparse(base)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return jsonify({
+            "error": f"Некорректный NVIDIA Base URL: {base!r}. "
+                     "Ожидается абсолютный http(s) URL."
+        }), 400
+
+    sub = subpath.lstrip("/")
+    target = f"{base}/{sub}" if sub else base
+    if request.query_string:
+        sep = "&" if "?" in target else "?"
+        target = target + sep + request.query_string.decode("utf-8", errors="ignore")
+
+    fwd_headers: dict[str, str] = {}
+    for hk, hv in request.headers.items():
+        if hk.lower() in _NVIDIA_PROXY_SKIP_REQ_HEADERS:
+            continue
+        fwd_headers[hk] = hv
+    # Явно проставляем Host upstream-а — некоторые промежуточные сети ругаются
+    # без него.
+    fwd_headers["Host"] = parsed.netloc
+
+    body: bytes | None = None
+    if request.method in ("POST", "PUT", "PATCH", "DELETE"):
+        body = request.get_data() or None
+
+    upstream_req = _urllib_request.Request(
+        target,
+        data=body,
+        method=request.method,
+        headers=fwd_headers,
+    )
+
+    timeout = _nvidia_proxy_timeout()
+    try:
+        upstream = _urllib_request.urlopen(upstream_req, timeout=timeout)
+    except _urllib_error.HTTPError as exc:
+        # 4xx/5xx — это НЕ ошибка прокси, а легитимный ответ NVIDIA. Тело
+        # ошибки нужно отдать клиенту как есть (там JSON с подробностями).
+        upstream = exc
+    except _urllib_error.URLError as exc:
+        reason = getattr(exc, "reason", exc)
+        return jsonify({
+            "error": f"NVIDIA upstream недоступен ({base}): {reason}",
+        }), 502
+    except (socket.timeout, TimeoutError):
+        return jsonify({
+            "error": f"NVIDIA upstream таймаут после {timeout:.0f}s. "
+                     "Увеличьте NVIDIA_PROXY_TIMEOUT для длинных стримов.",
+        }), 504
+    except Exception as exc:  # pragma: no cover - defensive
+        return jsonify({"error": f"NVIDIA proxy error: {exc}"}), 502
+
+    status = getattr(upstream, "status", None) or upstream.getcode() or 200
+
+    out_headers: list[tuple[str, str]] = []
+    for hk, hv in upstream.headers.items():
+        if hk.lower() in _NVIDIA_PROXY_SKIP_RESP_HEADERS:
+            continue
+        out_headers.append((hk, hv))
+
+    def _generate():
+        try:
+            while True:
+                try:
+                    chunk = upstream.read(8192)
+                except (socket.timeout, TimeoutError):
+                    # При таймауте посреди стрима просто завершаем — клиент
+                    # увидит обрыв SSE и сможет переподключиться.
+                    break
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            try:
+                upstream.close()
+            except Exception:
+                pass
+
+    return Response(
+        stream_with_context(_generate()),
+        status=status,
+        headers=out_headers,
+    )
+
+
+@app.route("/nvidia", methods=["GET"])
+@app.route("/nvidia/", methods=["GET"])
+def nvidia_proxy_info():
+    """Информация о встроенном NVIDIA-прокси для UI/диагностики."""
+    return jsonify({
+        "ok": True,
+        "default_base": NVIDIA_DEFAULT_BASE,
+        "configured_base": os.environ.get("NVIDIA_BASE_URL") or NVIDIA_DEFAULT_BASE,
+        "timeout_seconds": _nvidia_proxy_timeout(),
+        "hint": "POST /nvidia/chat/completions с заголовком "
+                "Authorization: Bearer nvapi-... — прокси форвардит запрос "
+                "и SSE-ответ в NVIDIA NIM.",
+    })
 
 
 # ═══════════════════════ /mem/* — память (БД-бэкенд для localStorage) ═══════

@@ -201,6 +201,47 @@ FRONTEND_PORT=9000 TERM_PORT=9876 bash start.sh
 
 ---
 
+## NVIDIA NIM — встроенный реверс-прокси (без CORS-обходов)
+
+Браузер не может ходить напрямую в `https://integrate.api.nvidia.com/v1` из
+`index.html` — NVIDIA не отдаёт CORS-заголовки. Раньше для этого приходилось
+подставлять внешний CORS-прокси (`https://corsproxy.io/?` и аналоги). Это
+неудобно и небезопасно: ваш `nvapi-...`-ключ проходит через сторонний сервер.
+
+С версии PR #34 в `wsapi_server.py` встроен **реверс-прокси** — никакая
+дополнительная настройка не нужна:
+
+```
+браузер → http://localhost:8764/nvidia/<path>  →  https://integrate.api.nvidia.com/v1/<path>
+```
+
+* Тот же origin, что и Workspace API (CORS уже разрешён через `flask-cors`).
+* Прокси форвардит `Authorization`, тело запроса и SSE-стрим как есть.
+* Ключ `nvapi-...` уходит **только** в саму NVIDIA, а не на чужой сервер.
+* Self-hosted NIM поддерживается через заголовок `X-Nvidia-Base-Url` —
+  фронтенд проставляет его автоматически из поля «NVIDIA Base URL».
+
+В UI настроек NVIDIA провайдера тоггл **«Встроенный прокси»** включён по
+умолчанию. Поле «Внешний CORS-прокси» осталось для обратной совместимости
+(например, если кто-то поднимает только frontend без `wsapi_server.py`).
+
+Тонкая настройка (`bash start.sh`):
+
+| Переменная | По умолчанию | Что меняет |
+| --- | --- | --- |
+| `NVIDIA_BASE_URL` | `https://integrate.api.nvidia.com/v1` | upstream по умолчанию для `/nvidia/<path>` (если клиент не прислал `X-Nvidia-Base-Url`). |
+| `NVIDIA_PROXY_TIMEOUT` | `900` | таймаут чтения upstream в секундах (важно для длинных SSE-стримов). |
+
+Быстрая проверка прокси из терминала:
+
+```bash
+curl -fsS http://localhost:8764/nvidia/        # info-эндпоинт
+curl -fsS -H "Authorization: Bearer nvapi-..." \
+     http://localhost:8764/nvidia/models | jq '.data | length'
+```
+
+---
+
 ## Запуск отдельных сервисов
 
 Удобно для отладки. Все четыре нужны вместе, но можно запустить любой по отдельности:

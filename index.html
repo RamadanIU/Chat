@@ -4912,13 +4912,34 @@ button:disabled, .icon-btn:disabled, input:disabled, textarea:disabled {
             </label>
             <input id="nvidiaBase" type="text" placeholder="https://integrate.api.nvidia.com/v1" />
 
+            <!-- Встроенный реверс-прокси (через Workspace API). По умолчанию ВКЛ —
+                 не нужны внешние CORS-прокси типа corsproxy.io: запрос идёт
+                 на тот же wsapi_server.py, который уже крутится в стеке, и
+                 оттуда форвардится в NVIDIA NIM (включая SSE-стрим). -->
+            <div style="margin-top:10px;">
+              <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-1);margin-bottom:6px;">
+                <i data-lucide="shield-check" style="width:14px;height:14px;color:var(--text-2);"></i>
+                Встроенный прокси (через Workspace API)
+              </label>
+              <div class="toggle-group">
+                <label class="toggle-switch">
+                  <input type="checkbox" id="nvidiaUseBuiltinProxy" checked>
+                  <span class="toggle-slider"></span>
+                </label>
+                <span class="toggle-label">Слать запросы NVIDIA через wsapi (обход CORS без внешних сервисов)</span>
+              </div>
+              <div style="margin-top:4px;font-size:10px;color:var(--text-2);line-height:1.4;">
+                Когда включено, браузер ходит на <code>${wsApiUrl}/nvidia/...</code> — внешний CORS-прокси не нужен. Ваш <code>nvapi-...</code>-ключ при этом никуда наружу не уходит, кроме как в саму NVIDIA. Отключите тоггл только если хотите явно ходить через свой backend/self-hosted NIM.
+              </div>
+            </div>
+
             <label style="display:flex;align-items:center;gap:6px;margin-top:10px;">
               <i data-lucide="shield" style="width:14px;height:14px;color:var(--text-2);"></i>
-              CORS‑прокси
+              Внешний CORS‑прокси (необязательно)
             </label>
             <input id="nvidiaProxy" type="text" placeholder="https://corsproxy.io/?" />
             <div style="margin-top:3px;font-size:10px;color:var(--text-2);line-height:1.4;">
-              Нужен для работы из браузера (обход CORS). Оставьте пустым если запросы идут через собственный self-hosted NIM или backend-прокси.
+              Используется только если встроенный прокси выключен. Оставьте пустым, если запросы идут через self-hosted NIM или собственный backend.
             </div>
 
             <div style="margin-top:8px;display:flex;gap:6px;align-items:center;">
@@ -6000,6 +6021,8 @@ function saveSettings() {
   if (nvidiaBase) localStorage.setItem('agent_nvidia_base', nvidiaBase);
   const nvidiaProxy = (document.getElementById('nvidiaProxy').value || '').trim();
   localStorage.setItem('agent_nvidia_proxy', nvidiaProxy);
+  localStorage.setItem('agent_nvidia_use_builtin_proxy',
+    document.getElementById('nvidiaUseBuiltinProxy').checked.toString());
   localStorage.setItem('agent_nvidia_show_thinking', document.getElementById('nvidiaShowThinking').checked.toString());
   localStorage.setItem('agent_nvidia_stream', document.getElementById('nvidiaStream').checked.toString());
   document.dispatchEvent(new CustomEvent('settings:saved'));
@@ -6083,6 +6106,12 @@ function loadSettings() {
   const savedNvidiaBase = localStorage.getItem('agent_nvidia_base') || 'https://integrate.api.nvidia.com/v1';
   document.getElementById('nvidiaBase').value = savedNvidiaBase;
   document.getElementById('nvidiaProxy').value = localStorage.getItem('agent_nvidia_proxy') || '';
+  // Встроенный прокси через wsapi включён по умолчанию: если ключ ещё не
+  // выставлен, считаем его true (новые установки сразу работают без внешних
+  // CORS-прокси). Для старых установок с настроенным внешним прокси значение
+  // тоже будет true — отдаём приоритет встроенному, а внешний превращается
+  // в ручной escape hatch (back-compat).
+  document.getElementById('nvidiaUseBuiltinProxy').checked = getNvidiaUseBuiltinProxy();
   document.getElementById('nvidiaShowThinking').checked = localStorage.getItem('agent_nvidia_show_thinking') !== 'false';
   document.getElementById('nvidiaStream').checked = localStorage.getItem('agent_nvidia_stream') === 'true';
   if (!isPuter) {
@@ -6220,6 +6249,7 @@ document.getElementById('deepseekTestBtn').addEventListener('click', async () =>
 // ═══════════ NVIDIA NIM — обработчики ═══════════
 document.getElementById('nvidiaBase').addEventListener('change', () => { saveSettings(); });
 document.getElementById('nvidiaProxy').addEventListener('change', () => { saveSettings(); });
+document.getElementById('nvidiaUseBuiltinProxy').addEventListener('change', saveSettings);
 document.getElementById('nvidiaShowThinking').addEventListener('change', saveSettings);
 document.getElementById('nvidiaStream').addEventListener('change', saveSettings);
 document.getElementById('nvidiaTestBtn').addEventListener('click', async () => {
@@ -10830,25 +10860,89 @@ function getNvidiaBase() {
   return raw.replace(/\/+$/, '');
 }
 
-/** Получить URL CORS-прокси для NVIDIA (без хвостовых слешей). */
+/** Получить URL внешнего CORS-прокси для NVIDIA (back-compat, без хвостовых слешей). */
 function getNvidiaProxy() {
   return (localStorage.getItem('agent_nvidia_proxy') || '').trim();
 }
 
 /**
- * Обёртка над fetch с поддержкой CORS-прокси для NVIDIA NIM.
- * Если прокси задан — подставляет его перед URL.
- * Формат прокси: "https://corsproxy.io/?" → finalUrl = proxy + encodeURIComponent(url)
- *                "https://my.proxy/"       → finalUrl = proxy + url
+ * Использовать ли встроенный прокси (через Workspace API) для NVIDIA.
+ * По умолчанию ВКЛЮЧЕНО — это убирает зависимость от внешних CORS-прокси
+ * вроде corsproxy.io: запрос идёт на тот же бэкенд, который и так
+ * крутится в стеке (`wsapi_server.py`), оттуда форвардится в NVIDIA.
+ */
+function getNvidiaUseBuiltinProxy() {
+  const v = localStorage.getItem('agent_nvidia_use_builtin_proxy');
+  return v === null ? true : v === 'true';
+}
+
+/**
+ * Базовый URL Workspace API (Flask на порту 8764). Используется как точка
+ * входа во встроенный реверс-прокси `/nvidia/<path>`.
+ */
+function getNvidiaProxyBase() {
+  const saved = (localStorage.getItem('agent_ws_api_url') || '').trim().replace(/\/+$/, '');
+  if (saved) return saved;
+  const def = (window.AGENT_PRO_DEFAULTS && window.AGENT_PRO_DEFAULTS.wsApiUrl) || '';
+  return (def || '').replace(/\/+$/, '');
+}
+
+/**
+ * Превратить полный NVIDIA-URL в путь после base.
+ *   https://integrate.api.nvidia.com/v1/chat/completions
+ *     → /chat/completions   (если base = https://integrate.api.nvidia.com/v1)
+ *     → /v1/chat/completions (если base = https://integrate.api.nvidia.com)
+ * Так wsapi сможет приклеить subpath к правильному upstream.
+ */
+function _stripNvidiaBase(url, nvBase) {
+  if (typeof url !== 'string') return '';
+  const base = (nvBase || '').replace(/\/+$/, '');
+  if (base && url.startsWith(base)) {
+    const tail = url.slice(base.length);
+    return tail.startsWith('/') ? tail : '/' + tail;
+  }
+  try {
+    const u = new URL(url);
+    return u.pathname + (u.search || '');
+  } catch {
+    return url.startsWith('/') ? url : '/' + url;
+  }
+}
+
+/**
+ * Обёртка над fetch для NVIDIA NIM, которая решает проблему CORS:
+ *   1) если включён встроенный прокси и Workspace API доступен —
+ *      шлём запрос на ${WSAPI}/nvidia/<subpath> (тот же origin, CORS уже ок),
+ *      бэкенд форвардит его в NVIDIA вместе с заголовком Authorization
+ *      и SSE-стримом;
+ *   2) иначе, для обратной совместимости, если задан внешний CORS-прокси —
+ *      используем его как раньше (corsproxy.io / реверс-прокси);
+ *   3) иначе шлём напрямую (работает только для self-hosted NIM или backend).
  */
 async function nvidiaProxiedFetch(url, options = {}) {
+  if (getNvidiaUseBuiltinProxy()) {
+    const wsBase = getNvidiaProxyBase();
+    if (wsBase) {
+      const nvBase = getNvidiaBase();
+      const subpath = _stripNvidiaBase(url, nvBase);
+      const finalUrl = wsBase.replace(/\/+$/, '') + '/nvidia' + subpath;
+      const headers = new Headers(options.headers || {});
+      // Сообщаем бэкенду upstream, чтобы можно было держать self-hosted NIM
+      // и публичный build.nvidia.com через один и тот же прокси.
+      headers.set('X-Nvidia-Base-Url', nvBase);
+      return fetch(finalUrl, { ...options, headers });
+    }
+  }
   const proxy = getNvidiaProxy();
-  if (!proxy) return fetch(url, options);
-  // corsproxy.io и аналоги ожидают закодированный URL после знака "?"
-  const finalUrl = proxy.endsWith('?')
-    ? proxy + encodeURIComponent(url)
-    : proxy.replace(/\/?$/, '/') + url;
-  return fetch(finalUrl, options);
+  if (proxy) {
+    // Внешний CORS-прокси — back-compat для тех, у кого нет wsapi.
+    // corsproxy.io и аналоги ожидают закодированный URL после знака "?".
+    const finalUrl = proxy.endsWith('?')
+      ? proxy + encodeURIComponent(url)
+      : proxy.replace(/\/?$/, '/') + url;
+    return fetch(finalUrl, options);
+  }
+  return fetch(url, options);
 }
 
 /* ========= Qwen AI Kit — полная интеграция API ========= */
@@ -11403,10 +11497,12 @@ async function callNvidia(model, key, messages, tools, temperature, signalOverri
   } catch (netErr) {
     if (netErr.name === 'AbortError') throw netErr;
     if (netErr.name === 'TypeError' || (netErr.message || '').includes('fetch')) {
-      throw new Error(
-        `NVIDIA NIM недоступен по адресу ${base}. ` +
-        `Проверьте Base URL, CORS-прокси и сетевое соединение.`
-      );
+      const builtin = getNvidiaUseBuiltinProxy();
+      const wsBase  = builtin ? getNvidiaProxyBase() : '';
+      const hint    = builtin && wsBase
+        ? `Встроенный прокси указывает на ${wsBase}/nvidia/... — проверьте, что Workspace API доступен (см. wsapi_server.py).`
+        : `Проверьте Base URL, внешний CORS-прокси и сетевое соединение.`;
+      throw new Error(`NVIDIA NIM недоступен по адресу ${base}. ${hint}`);
     }
     throw netErr;
   }
