@@ -25,6 +25,14 @@ Endpoints (NVIDIA NIM reverse-proxy — для обхода CORS из брауз
                                               Заменяет внешние CORS-прокси
                                               вроде corsproxy.io.
 
+Endpoints (Ollama reverse-proxy — для обхода CORS из браузера):
+    ANY  /ollama/<path>                    — прозрачный реверс-прокси к
+                                              http://localhost:11434 (или к
+                                              X-Ollama-Base-Url из заголовка).
+                                              Поддерживает SSE-стрим, ndjson
+                                              (для /api/pull) и Ollama Cloud
+                                              (https://ollama.com).
+
 Endpoints (memory — БД-бэкенд для всего, что раньше жило в localStorage):
     GET  /mem/health                       — статус БД, счётчики
     GET  /mem/export                       — полный снэпшот (kv + чаты + скилы + MCP)
@@ -67,6 +75,12 @@ Endpoints (system — обновление установки):
     NVIDIA_PROXY_TIMEOUT таймаут чтения upstream в секундах для /nvidia/<path>
                         (default: 900). SSE может тянуться долго —
                         ставьте побольше.
+    OLLAMA_BASE_URL     дефолтный upstream для /ollama/<path>
+                        (default: http://localhost:11434). Клиент может
+                        переопределить заголовком X-Ollama-Base-Url.
+    OLLAMA_PROXY_TIMEOUT таймаут чтения upstream для /ollama/<path>
+                        (default: 900). Pull большой модели — это часы,
+                        ставьте по нужде.
 """
 
 from __future__ import annotations
@@ -745,6 +759,191 @@ def nvidia_proxy_info():
         "hint": "POST /nvidia/chat/completions с заголовком "
                 "Authorization: Bearer nvapi-... — прокси форвардит запрос "
                 "и SSE-ответ в NVIDIA NIM.",
+    })
+
+
+# ═══════════════════════ /ollama/* — реверс-прокси к Ollama ═════════════════
+#
+# Ollama сервер (по умолчанию http://localhost:11434) отдаёт CORS-заголовки
+# только если поднять его с `OLLAMA_ORIGINS=*`. Чтобы пользователю не
+# приходилось перенастраивать systemd-сервис / launchctl — повторяем тот же
+# трюк, что и для NVIDIA: проксируем запросы через wsapi (тот же origin).
+#
+# URL-схема:
+#     /ollama/v1/chat/completions   → ${BASE}/v1/chat/completions  (OpenAI-compat chat)
+#     /ollama/v1/models             → ${BASE}/v1/models
+#     /ollama/api/tags              → ${BASE}/api/tags             (native list)
+#     /ollama/api/pull              → ${BASE}/api/pull             (ndjson stream)
+#     /ollama/api/version           → ${BASE}/api/version
+# где BASE = X-Ollama-Base-Url > $OLLAMA_BASE_URL > http://localhost:11434.
+
+OLLAMA_DEFAULT_BASE = "http://localhost:11434"
+
+_OLLAMA_PROXY_SKIP_REQ_HEADERS = frozenset({
+    "host",
+    "content-length",
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailers",
+    "transfer-encoding",
+    "upgrade",
+    "x-ollama-base-url",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-real-ip",
+    "origin",
+    "referer",
+    "cookie",
+})
+
+_OLLAMA_PROXY_SKIP_RESP_HEADERS = frozenset({
+    "connection",
+    "transfer-encoding",
+    "content-encoding",
+    "content-length",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailers",
+    "upgrade",
+    # flask_cors сам выставит CORS-заголовки.
+    "access-control-allow-origin",
+    "access-control-allow-credentials",
+    "access-control-expose-headers",
+})
+
+
+def _ollama_proxy_timeout() -> float:
+    raw = os.environ.get("OLLAMA_PROXY_TIMEOUT", "").strip()
+    try:
+        v = float(raw) if raw else 900.0
+    except ValueError:
+        v = 900.0
+    return v if v > 0 else 900.0
+
+
+def _ollama_target_base() -> str:
+    """Куда форвардим: X-Ollama-Base-Url > $OLLAMA_BASE_URL > default."""
+    base = (
+        request.headers.get("X-Ollama-Base-Url")
+        or os.environ.get("OLLAMA_BASE_URL")
+        or OLLAMA_DEFAULT_BASE
+    ).strip()
+    return base.rstrip("/")
+
+
+@app.route(
+    "/ollama/<path:subpath>",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+)
+def ollama_proxy(subpath: str):
+    """Прозрачный реверс-прокси к Ollama (Local & Cloud).
+
+    Поддерживает SSE/ndjson-стриминг: upstream-ответ читается чанками и сразу
+    отдаётся вниз по соединению, без буферизации всего тела (важно для
+    /api/pull и /v1/chat/completions со stream=true).
+    """
+    if request.method == "OPTIONS":
+        return ("", 204)
+
+    base = _ollama_target_base()
+    parsed = _urllib_parse.urlparse(base)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return jsonify({
+            "error": f"Некорректный Ollama Base URL: {base!r}. "
+                     "Ожидается абсолютный http(s) URL."
+        }), 400
+
+    sub = subpath.lstrip("/")
+    target = f"{base}/{sub}" if sub else base
+    if request.query_string:
+        sep = "&" if "?" in target else "?"
+        target = target + sep + request.query_string.decode("utf-8", errors="ignore")
+
+    fwd_headers: dict[str, str] = {}
+    for hk, hv in request.headers.items():
+        if hk.lower() in _OLLAMA_PROXY_SKIP_REQ_HEADERS:
+            continue
+        fwd_headers[hk] = hv
+    fwd_headers["Host"] = parsed.netloc
+
+    body: bytes | None = None
+    if request.method in ("POST", "PUT", "PATCH", "DELETE"):
+        body = request.get_data() or None
+
+    upstream_req = _urllib_request.Request(
+        target,
+        data=body,
+        method=request.method,
+        headers=fwd_headers,
+    )
+
+    timeout = _ollama_proxy_timeout()
+    try:
+        upstream = _urllib_request.urlopen(upstream_req, timeout=timeout)
+    except _urllib_error.HTTPError as exc:
+        upstream = exc
+    except _urllib_error.URLError as exc:
+        reason = getattr(exc, "reason", exc)
+        return jsonify({
+            "error": f"Ollama upstream недоступен ({base}): {reason}",
+        }), 502
+    except (socket.timeout, TimeoutError):
+        return jsonify({
+            "error": f"Ollama upstream таймаут после {timeout:.0f}s. "
+                     "Увеличьте OLLAMA_PROXY_TIMEOUT для длинных стримов / pull.",
+        }), 504
+    except Exception as exc:  # pragma: no cover - defensive
+        return jsonify({"error": f"Ollama proxy error: {exc}"}), 502
+
+    status = getattr(upstream, "status", None) or upstream.getcode() or 200
+
+    out_headers: list[tuple[str, str]] = []
+    for hk, hv in upstream.headers.items():
+        if hk.lower() in _OLLAMA_PROXY_SKIP_RESP_HEADERS:
+            continue
+        out_headers.append((hk, hv))
+
+    def _generate():
+        try:
+            while True:
+                try:
+                    chunk = upstream.read(8192)
+                except (socket.timeout, TimeoutError):
+                    break
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            try:
+                upstream.close()
+            except Exception:
+                pass
+
+    return Response(
+        stream_with_context(_generate()),
+        status=status,
+        headers=out_headers,
+    )
+
+
+@app.route("/ollama", methods=["GET"])
+@app.route("/ollama/", methods=["GET"])
+def ollama_proxy_info():
+    """Информация о встроенном Ollama-прокси для UI/диагностики."""
+    return jsonify({
+        "ok": True,
+        "default_base": OLLAMA_DEFAULT_BASE,
+        "configured_base": os.environ.get("OLLAMA_BASE_URL") or OLLAMA_DEFAULT_BASE,
+        "timeout_seconds": _ollama_proxy_timeout(),
+        "hint": "POST /ollama/v1/chat/completions с заголовком "
+                "X-Ollama-Base-Url: http://host:11434 — прокси форвардит "
+                "запрос и SSE-ответ в Ollama (Local или Cloud).",
     })
 
 
