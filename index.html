@@ -4717,22 +4717,18 @@ button:disabled, .icon-btn:disabled, input:disabled, textarea:disabled {
           <div class="setting-row">
             <label>Провайдер</label>
             <select id="provider" class="input-modern">
-              <optgroup label="Облачные" id="providerGroupCloud">
-                <option value="openai">OpenAI</option>
-                <option value="nvidia">NVIDIA NIM (build.nvidia.com)</option>
-                <option value="openrouter">OpenRouter</option>
-                <option value="groq">Groq</option>
-                <option value="mistral">Mistral AI</option>
-                <option value="gemini">Google Gemini</option>
-                <option value="glm">GLM (Z.AI)</option>
-                <option value="deepseek">DeepSeek Free (ds2api)</option>
-                <option value="qwen">Qwen (aikit.club)</option>
-                <option value="puter">Puter.js</option>
-              </optgroup>
-              <optgroup label="Локальные / self-hosted" id="providerGroupLocal">
-                <option value="ollama">Ollama (Local & Cloud)</option>
-              </optgroup>
-              <optgroup label="Кастомные" id="providerGroupCustom" style="display:none;"></optgroup>
+              <option value="openai">OpenAI</option>
+              <option value="nvidia">NVIDIA NIM (build.nvidia.com)</option>
+              <option value="openrouter">OpenRouter</option>
+              <option value="groq">Groq</option>
+              <option value="mistral">Mistral AI</option>
+              <option value="gemini">Google Gemini</option>
+              <option value="glm">GLM (Z.AI)</option>
+              <option value="deepseek">DeepSeek Free (ds2api)</option>
+              <option value="qwen">Qwen (aikit.club)</option>
+              <option value="puter">Puter.js</option>
+              <option value="ollama">Ollama (Local & Cloud)</option>
+              <!-- Кастомные провайдеры подставляются JS-ом ниже (renderCustomProvidersInSelect). -->
             </select>
           </div>
 
@@ -5016,6 +5012,26 @@ button:disabled, .icon-btn:disabled, input:disabled, textarea:disabled {
                 <i data-lucide="wifi" style="width:12px;height:12px;"></i> Проверить
               </button>
               <span id="ollamaTestStatus" style="font-size:11px;color:var(--text-2);"></span>
+            </div>
+
+            <!-- Встроенный реверс-прокси (через Workspace API). По умолчанию ВКЛ —
+                 решает проблему CORS: Ollama по дефолту отвечает только своему
+                 origin'у, а wsapi_server.py форвардит запрос со своего бэкенда. -->
+            <div style="margin-top:10px;">
+              <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-1);margin-bottom:6px;">
+                <i data-lucide="shield-check" style="width:14px;height:14px;color:var(--text-2);"></i>
+                Встроенный прокси (через Workspace API)
+              </label>
+              <div class="toggle-group">
+                <label class="toggle-switch">
+                  <input type="checkbox" id="ollamaUseBuiltinProxy" checked>
+                  <span class="toggle-slider"></span>
+                </label>
+                <span class="toggle-label">Слать запросы Ollama через wsapi (обход CORS без OLLAMA_ORIGINS=*)</span>
+              </div>
+              <div style="margin-top:4px;font-size:10px;color:var(--text-2);line-height:1.4;">
+                Когда включено, браузер ходит на <code>${wsApiUrl}/ollama/...</code>, а wsapi форвардит запрос на ваш Ollama Base URL (Local или Cloud) — то же самое, что NVIDIA-прокси. Отключите тоггл, если запустили Ollama с <code>OLLAMA_ORIGINS=*</code> и хотите ходить напрямую.
+              </div>
             </div>
 
             <!-- Ollama keep_alive -->
@@ -6173,6 +6189,9 @@ function saveSettings() {
   if (ollamaStreamEl) localStorage.setItem('agent_ollama_stream', ollamaStreamEl.checked.toString());
   const ollamaShowThinkingEl = document.getElementById('ollamaShowThinking');
   if (ollamaShowThinkingEl) localStorage.setItem('agent_ollama_show_thinking', ollamaShowThinkingEl.checked.toString());
+  const ollamaUseBuiltinProxyEl = document.getElementById('ollamaUseBuiltinProxy');
+  if (ollamaUseBuiltinProxyEl) localStorage.setItem('agent_ollama_use_builtin_proxy',
+    ollamaUseBuiltinProxyEl.checked.toString());
   document.dispatchEvent(new CustomEvent('settings:saved'));
 }
 function getCurrentKey() {
@@ -6266,6 +6285,8 @@ function loadSettings() {
   if (ollamaStreamInput) ollamaStreamInput.checked = localStorage.getItem('agent_ollama_stream') === 'true';
   const ollamaShowThinkingInput = document.getElementById('ollamaShowThinking');
   if (ollamaShowThinkingInput) ollamaShowThinkingInput.checked = localStorage.getItem('agent_ollama_show_thinking') !== 'false';
+  const ollamaUseBuiltinProxyInput = document.getElementById('ollamaUseBuiltinProxy');
+  if (ollamaUseBuiltinProxyInput) ollamaUseBuiltinProxyInput.checked = getOllamaUseBuiltinProxy();
   // Qwen AI Kit settings
   const savedQwenBase = localStorage.getItem('agent_qwen_base') || 'https://qwen.aikit.club';
   document.getElementById('qwenBase').value = savedQwenBase;
@@ -6493,6 +6514,8 @@ document.getElementById('nvidiaTestBtn').addEventListener('click', async () => {
   if (stream) stream.addEventListener('change', saveSettings);
   const showThinking = document.getElementById('ollamaShowThinking');
   if (showThinking) showThinking.addEventListener('change', saveSettings);
+  const useBuiltinProxy = document.getElementById('ollamaUseBuiltinProxy');
+  if (useBuiltinProxy) useBuiltinProxy.addEventListener('change', saveSettings);
 
   const testBtn = document.getElementById('ollamaTestBtn');
   if (testBtn) testBtn.addEventListener('click', async () => {
@@ -6573,23 +6596,25 @@ document.getElementById('nvidiaTestBtn').addEventListener('click', async () => {
 
 // ═══════════ Кастомные провайдеры — UI/CRUD ═══════════
 function rebuildCustomProvidersUI() {
-  const optgroup = document.getElementById('providerGroupCustom');
+  const select = document.getElementById('provider');
   const list = document.getElementById('customProvidersList');
-  if (!optgroup || !list) return;
+  if (!select || !list) return;
 
-  // Перестраиваем optgroup
-  while (optgroup.firstChild) optgroup.removeChild(optgroup.firstChild);
+  // Удаляем ранее добавленные option'ы кастомных провайдеров и
+  // дописываем актуальные в конец плоского списка <select>.
+  const prevValue = select.value;
+  Array.from(select.querySelectorAll(`option[value^="${CUSTOM_PROVIDER_PREFIX}"]`))
+    .forEach(opt => opt.remove());
   const providers = getCustomProviders();
-  if (!providers.length) {
-    optgroup.style.display = 'none';
-  } else {
-    optgroup.style.display = '';
-    providers.forEach(p => {
-      const opt = document.createElement('option');
-      opt.value = CUSTOM_PROVIDER_PREFIX + p.id;
-      opt.textContent = p.name + ' (custom)';
-      optgroup.appendChild(opt);
-    });
+  providers.forEach(p => {
+    const opt = document.createElement('option');
+    opt.value = CUSTOM_PROVIDER_PREFIX + p.id;
+    opt.textContent = p.name + ' (custom)';
+    select.appendChild(opt);
+  });
+  // Сохраняем выбранное значение, даже если это кастомный провайдер.
+  if (prevValue && Array.from(select.options).some(o => o.value === prevValue)) {
+    select.value = prevValue;
   }
 
   // Перестраиваем список под кнопкой "Добавить"
@@ -11744,7 +11769,79 @@ async function nvidiaProxiedFetch(url, options = {}) {
  *   - native /api/version для проверки соединения
  *   - keep_alive, think (reasoning_content) — сквозные опции
  *   - Ollama Cloud (ollama.com) — тот же путь, нужен Bearer-ключ
+ *   - встроенный CORS-прокси (через wsapi `/ollama/<path>`) — по дефолту ВКЛ,
+ *     чтобы не требовать перезапуска `ollama serve` с OLLAMA_ORIGINS=*.
  */
+
+/**
+ * Использовать ли встроенный прокси (через Workspace API) для Ollama.
+ * По умолчанию ВКЛЮЧЕНО — CORS у Ollama закрыт, и проще проксировать через
+ * wsapi (тот же origin, что и UI), чем перенастраивать ollama serve.
+ */
+function getOllamaUseBuiltinProxy() {
+  const v = localStorage.getItem('agent_ollama_use_builtin_proxy');
+  return v === null ? true : v === 'true';
+}
+
+/**
+ * Базовый URL Workspace API (Flask на порту 8764). Используется как точка
+ * входа во встроенный реверс-прокси `/ollama/<path>`. Логика идентична
+ * `getNvidiaProxyBase()`, продублирована для читаемости.
+ */
+function getOllamaProxyBase() {
+  const saved = (localStorage.getItem('agent_ws_api_url') || '').trim().replace(/\/+$/, '');
+  if (saved) return saved;
+  const def = (window.AGENT_PRO_DEFAULTS && window.AGENT_PRO_DEFAULTS.wsApiUrl) || '';
+  return (def || '').replace(/\/+$/, '');
+}
+
+/**
+ * Превратить полный Ollama-URL в путь после base.
+ *   http://localhost:11434/api/tags   → /api/tags
+ *   https://ollama.com/v1/chat/completions
+ *     → /v1/chat/completions  (если base = https://ollama.com)
+ * wsapi приклеит subpath к upstream, переданному в X-Ollama-Base-Url.
+ */
+function _stripOllamaBase(url, ollBase) {
+  if (typeof url !== 'string') return '';
+  const base = (ollBase || '').replace(/\/+$/, '');
+  if (base && url.startsWith(base)) {
+    const tail = url.slice(base.length);
+    return tail.startsWith('/') ? tail : '/' + tail;
+  }
+  try {
+    const u = new URL(url);
+    return u.pathname + (u.search || '');
+  } catch {
+    return url.startsWith('/') ? url : '/' + url;
+  }
+}
+
+/**
+ * Обёртка над fetch для Ollama, которая решает проблему CORS:
+ *   1) если включён встроенный прокси и Workspace API доступен —
+ *      шлём запрос на ${WSAPI}/ollama/<subpath> (тот же origin),
+ *      бэкенд форвардит его на Ollama (Local или Cloud) вместе с
+ *      заголовком Authorization (для Cloud), телом и стримом;
+ *   2) иначе шлём напрямую (работает только если Ollama поднята с
+ *      OLLAMA_ORIGINS=* или находится на том же origin).
+ */
+async function ollamaProxiedFetch(url, options = {}) {
+  if (getOllamaUseBuiltinProxy()) {
+    const wsBase = getOllamaProxyBase();
+    if (wsBase) {
+      const ollBase = getOllamaBase();
+      const subpath = _stripOllamaBase(url, ollBase);
+      const finalUrl = wsBase.replace(/\/+$/, '') + '/ollama' + subpath;
+      const headers = new Headers(options.headers || {});
+      // wsapi использует этот заголовок как upstream — поддерживает и
+      // Local (http://localhost:11434), и Cloud (https://ollama.com).
+      headers.set('X-Ollama-Base-Url', ollBase);
+      return fetch(finalUrl, { ...options, headers });
+    }
+  }
+  return fetch(url, options);
+}
 
 /** Базовый URL Ollama без хвостовых слешей. */
 function getOllamaBase() {
@@ -11863,7 +11960,7 @@ async function callOllama(model, key, messages, tools, temperature, signalOverri
 
   let res;
   try {
-    res = await fetch(endpoint, {
+    res = await ollamaProxiedFetch(endpoint, {
       method: 'POST',
       headers: ollamaHeaders(key, useStream ? 'text/event-stream' : 'application/json'),
       body: JSON.stringify(body),
@@ -11965,7 +12062,7 @@ async function callOllama(model, key, messages, tools, temperature, signalOverri
 /** GET /api/version — для health-check. */
 async function ollamaPing(base, key) {
   const url = (base || getOllamaBase()).replace(/\/+$/, '') + '/api/version';
-  const res = await fetch(url, { headers: ollamaHeaders(key) });
+  const res = await ollamaProxiedFetch(url, { headers: ollamaHeaders(key) });
   if (!res.ok) throw new Error('HTTP ' + res.status);
   return res.json();
 }
@@ -11973,7 +12070,7 @@ async function ollamaPing(base, key) {
 /** GET /api/tags — установленные локально модели + метаданные. */
 async function ollamaListModels(base, key) {
   const url = (base || getOllamaBase()).replace(/\/+$/, '') + '/api/tags';
-  const res = await fetch(url, { headers: ollamaHeaders(key) });
+  const res = await ollamaProxiedFetch(url, { headers: ollamaHeaders(key) });
   if (!res.ok) throw new Error('HTTP ' + res.status);
   const data = await res.json();
   const arr = Array.isArray(data?.models) ? data.models : [];
@@ -12001,7 +12098,7 @@ async function ollamaListModels(base, key) {
 /** POST /api/pull — стримит прогресс через ndjson. */
 async function ollamaPullModel(modelName, base, key, onProgress) {
   const url = (base || getOllamaBase()).replace(/\/+$/, '') + '/api/pull';
-  const res = await fetch(url, {
+  const res = await ollamaProxiedFetch(url, {
     method: 'POST',
     headers: ollamaHeaders(key),
     body: JSON.stringify({ model: modelName, stream: true }),
