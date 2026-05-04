@@ -6595,6 +6595,14 @@ document.getElementById('nvidiaTestBtn').addEventListener('click', async () => {
 })();
 
 // ═══════════ Кастомные провайдеры — UI/CRUD ═══════════
+// Объявлены здесь (а не вместе с CRUD-хелперами ниже), потому что
+// rebuildCustomProvidersUI() вызывается синхронно через setupCustomProvidersHandlers,
+// до того как поток исполнения дойдёт до полного блока «custom providers core».
+// const внутри одного <script> попадает в TDZ до своей строки декларации,
+// поэтому хранилище-ключ и префикс должны быть видны раньше первого вызова UI.
+const CUSTOM_PROVIDERS_LS = 'agent_custom_providers';
+const CUSTOM_PROVIDER_PREFIX = 'custom:';
+
 function rebuildCustomProvidersUI() {
   const select = document.getElementById('provider');
   const list = document.getElementById('customProvidersList');
@@ -12147,10 +12155,11 @@ async function ollamaPullModel(modelName, base, key, onProgress) {
  *   [{ id, name, baseUrl, modelsPath, chatPath, defaultModel, headers: [{k,v}] }]
  * API-ключ для каждого провайдера хранится в `agent_key_custom:<id>` —
  * совместимо со стандартным getCurrentKey()/saveCurrentKey().
+ *
+ * NB: `CUSTOM_PROVIDERS_LS` и `CUSTOM_PROVIDER_PREFIX` объявлены выше
+ * (в секции «UI/CRUD»), чтобы избежать TDZ при синхронном вызове
+ * rebuildCustomProvidersUI() во время загрузки скрипта.
  */
-
-const CUSTOM_PROVIDERS_LS = 'agent_custom_providers';
-const CUSTOM_PROVIDER_PREFIX = 'custom:';
 
 function isCustomProvider(provider) {
   return typeof provider === 'string' && provider.startsWith(CUSTOM_PROVIDER_PREFIX);
