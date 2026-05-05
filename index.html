@@ -13,15 +13,43 @@
 (function () {
   var loc = (typeof window !== 'undefined' && window.location) ? window.location : {};
   var fallbackHost = (loc.hostname && loc.hostname !== '' && loc.protocol !== 'file:') ? loc.hostname : 'localhost';
+  // Если страница открыта по https — все сервисы должны быть на wss/https,
+  // иначе браузер режет mixed-content. Выбираем схему по location.protocol,
+  // чтобы fallback (когда run.py не подставил AGENT_PRO_DEFAULTS) тоже работал.
+  var isHttps = (loc.protocol === 'https:');
+  var wsScheme   = isHttps ? 'wss://'   : 'ws://';
+  var httpScheme = isHttps ? 'https://' : 'http://';
   var injected = (typeof window !== 'undefined' && window.AGENT_PRO_DEFAULTS) || {};
   window.AGENT_PRO_DEFAULTS = {
-    termUrl:    injected.termUrl    || ('ws://'   + fallbackHost + ':8765'),
-    wsApiUrl:   injected.wsApiUrl   || ('http://' + fallbackHost + ':8764'),
-    bridgeUrl:  injected.bridgeUrl  || ('ws://127.0.0.1:7777'),
+    termUrl:    injected.termUrl    || (wsScheme   + fallbackHost + ':8765'),
+    wsApiUrl:   injected.wsApiUrl   || (httpScheme + fallbackHost + ':8764'),
+    bridgeUrl:  injected.bridgeUrl  || (wsScheme   + '127.0.0.1:7777'),
     termPort:   injected.termPort   || 8765,
     wsApiPort:  injected.wsApiPort  || 8764,
-    bridgePort: injected.bridgePort || 7777
+    bridgePort: injected.bridgePort || 7777,
+    tls:        (typeof injected.tls === 'boolean') ? injected.tls : isHttps
   };
+
+  // Миграция старых значений в localStorage. Если страница открыта по https,
+  // а сохранённые ранее адреса начинаются с ws://, http:// (HTTP-эра) —
+  // апгрейдим их до wss://, https://. Без этого старые пользователи будут
+  // получать mixed-content до тех пор, пока вручную не пересохранят настройки.
+  if (isHttps) {
+    try {
+      var ls = window.localStorage;
+      if (ls) {
+        var migrate = function (key, fromScheme, toScheme) {
+          var v = ls.getItem(key);
+          if (typeof v === 'string' && v.indexOf(fromScheme) === 0) {
+            ls.setItem(key, toScheme + v.slice(fromScheme.length));
+          }
+        };
+        migrate('agent_term_host',   'ws://',   'wss://');
+        migrate('agent_ws_api_url',  'http://', 'https://');
+        migrate('agent_mem_db_url',  'http://', 'https://');
+      }
+    } catch (e) { /* localStorage может быть недоступен — это не фатально */ }
+  }
 })();
 </script>
 

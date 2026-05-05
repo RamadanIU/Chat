@@ -14,16 +14,25 @@
 #   bash start.sh doctor           — диагностика: кто держит порты + state-файл.
 #   bash start.sh cleanup          — освободить порты, прибить сирот предыдущего запуска.
 #
+# TLS/HTTPS:
+#   По умолчанию стек поднимается по https/wss с автосгенерированным
+#   самоподписанным сертификатом в ~/.cache/chat-stack/tls/. Чтобы:
+#     • подложить свой серт (Let's Encrypt / mkcert):
+#         AGENT_PRO_TLS_CERT=/path/to/fullchain.pem AGENT_PRO_TLS_KEY=/path/to/privkey.pem
+#     • отключить TLS (напр. за reverse-proxy nginx/Caddy):
+#         AGENT_PRO_TLS=0 bash start.sh
+#
 # Флаги (для foreground / start):
 #   --no-browser     не ставить agent-browser shim.
 #   --no-browser-act не ставить BrowserAct CLI.
 #   --skip-deps      пропустить установку зависимостей (только запуск).
 #
-# Что получаем после запуска:
-#   • Frontend (index.html)        http://localhost:8080  (HTTP Basic Auth)
-#   • Workspace API                http://localhost:8764/ws/ping
-#   • Terminal Server (WebSocket)  ws://localhost:8765/term  |  /exec
-#   • MCP stdio Bridge             ws://127.0.0.1:7777
+# Что получаем после запуска (ниже — HTTPS-схема по умолчанию;
+# при AGENT_PRO_TLS=0 — соответствующие http:// и ws://):
+#   • Frontend (index.html)        https://localhost:8080  (HTTP Basic Auth)
+#   • Workspace API                https://localhost:8764/ws/ping
+#   • Terminal Server (WebSocket)  wss://localhost:8765/term  |  /exec
+#   • MCP stdio Bridge             wss://127.0.0.1:7777
 #   • CLI agent-browser            (для browser_action в чате)
 #   • CLI browser-act              (BrowserAct: stealth/real Chrome/captcha/network)
 #
@@ -74,7 +83,7 @@ while [ $# -gt 0 ]; do
     --no-browser-act) WITH_BROWSER_ACT=0; shift ;;
     --skip-deps)      SKIP_DEPS=1;        shift ;;
     --help|-h)
-      sed -n '2,38p' "$0"
+      sed -n '2,47p' "$0"
       exit 0
       ;;
     *) PASSTHROUGH+=("$1"); shift ;;
@@ -341,11 +350,22 @@ print_status() {
       uptime="?"
     fi
     ok "Daemon работает (pid=$pid, uptime=$uptime)"
-    echo "  Frontend       : http://localhost:${FP}"
-    echo "  Workspace API  : http://localhost:${WP}/ws/ping"
-    echo "  Terminal (ws)  : ws://localhost:${TP}/term  |  /exec"
-    echo "  MCP bridge     : ws://127.0.0.1:${BP}"
+    # Схема по умолчанию — https/wss; AGENT_PRO_TLS=0 выключает TLS для всех сервисов.
+    local TLS_RAW SCH_HTTP SCH_WS
+    TLS_RAW="$(printf '%s' "${AGENT_PRO_TLS:-1}" | tr '[:upper:]' '[:lower:]')"
+    case "$TLS_RAW" in
+      0|false|no|off|"") SCH_HTTP="http";  SCH_WS="ws"  ;;
+      *)                 SCH_HTTP="https"; SCH_WS="wss" ;;
+    esac
+    echo "  Frontend       : ${SCH_HTTP}://localhost:${FP}"
+    echo "  Workspace API  : ${SCH_HTTP}://localhost:${WP}/ws/ping"
+    echo "  Terminal (ws)  : ${SCH_WS}://localhost:${TP}/term  |  /exec"
+    echo "  MCP bridge     : ${SCH_WS}://127.0.0.1:${BP}"
     echo "  Лог            : ${LOG_FILE}"
+    if [ "$SCH_HTTP" = "https" ]; then
+      local TLS_CERT_PATH="${AGENT_PRO_TLS_CERT:-${HOME}/.cache/chat-stack/tls/cert.pem}"
+      echo "  TLS cert       : ${TLS_CERT_PATH} (самоподписанный — браузер предупредит о безопасности)"
+    fi
     if [ "${AUTH_DISABLE:-0}" = "1" ]; then
       echo "  Auth (frontend): ОТКЛЮЧЕНА (AUTH_DISABLE=1)"
     else

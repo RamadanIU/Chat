@@ -1403,6 +1403,14 @@ def main() -> None:
     parser.add_argument("--host", default=os.environ.get("WORKSPACE_HOST", "0.0.0.0"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("WORKSPACE_PORT", "8764")))
     parser.add_argument("--allowed-roots", help="':'-разделённый список разрешённых корней (переопределяет $WORKSPACE_ROOTS).")
+    # ── TLS ──────────────────────────────────────────────────────────────────
+    # Когда run.py поднимает стек по HTTPS, он передаёт сюда пути к сертификату
+    # и ключу. При прямом запуске wsapi_server.py отдельно — можно не указывать
+    # (или подложить свои), тогда работаем по чистому HTTP.
+    parser.add_argument("--cert", default=os.environ.get("AGENT_PRO_TLS_CERT") or None,
+                        help="PEM-сертификат для HTTPS (вместе с --key).")
+    parser.add_argument("--key", default=os.environ.get("AGENT_PRO_TLS_KEY") or None,
+                        help="PEM-ключ для HTTPS (вместе с --cert).")
     args = parser.parse_args()
 
     global BASE_DIR, ALLOWED_ROOTS
@@ -1412,15 +1420,27 @@ def main() -> None:
     if args.allowed_roots:
         ALLOWED_ROOTS = [os.path.abspath(os.path.expanduser(p)) for p in args.allowed_roots.split(":") if p.strip()]
 
-    print(f"● Workspace API запущен на http://{args.host}:{args.port}")
+    ssl_context = None
+    scheme = "http"
+    if args.cert and args.key:
+        if not (os.path.isfile(args.cert) and os.path.isfile(args.key)):
+            raise SystemExit(
+                f"--cert/--key указаны, но файлы не найдены: cert={args.cert} key={args.key}"
+            )
+        ssl_context = (args.cert, args.key)
+        scheme = "https"
+
+    print(f"● Workspace API запущен на {scheme}://{args.host}:{args.port}")
     print(f"  Рабочая область : {BASE_DIR}")
     print(f"  Разрешённые корни: {ALLOWED_ROOTS}")
+    if ssl_context is not None:
+        print(f"  TLS             : cert={args.cert} key={args.key}")
     try:
         mem_path = memory_db().path
         print(f"  БД памяти       : {mem_path}")
     except Exception as e:
         print(f"  БД памяти       : недоступна ({e})")
-    app.run(host=args.host, port=args.port, debug=False)
+    app.run(host=args.host, port=args.port, debug=False, ssl_context=ssl_context)
 
 
 if __name__ == "__main__":

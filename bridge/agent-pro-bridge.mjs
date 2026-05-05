@@ -16,10 +16,22 @@
 import { WebSocketServer } from 'ws';
 import { spawn } from 'node:child_process';
 import http from 'node:http';
+import https from 'node:https';
+import fs from 'node:fs';
 
 const PORT = Number(process.env.AGENT_PRO_BRIDGE_PORT || 7777);
 const HOST = process.env.AGENT_PRO_BRIDGE_HOST || '127.0.0.1';
 const VERSION = '1.1.0';
+
+// ── TLS ─────────────────────────────────────────────────────────────────────
+// Когда run.py поднимает стек по HTTPS, он пробрасывает пути к сертификату и
+// ключу через TLS_CERT/TLS_KEY (или AGENT_PRO_BRIDGE_TLS_*). Если они есть —
+// стартуем HTTPS-сервер (WebSocket становится wss://). Иначе — старый ws://.
+const TLS_CERT = process.env.AGENT_PRO_BRIDGE_TLS_CERT || process.env.TLS_CERT || '';
+const TLS_KEY  = process.env.AGENT_PRO_BRIDGE_TLS_KEY  || process.env.TLS_KEY  || '';
+const TLS_ENABLED = !!(TLS_CERT && TLS_KEY && fs.existsSync(TLS_CERT) && fs.existsSync(TLS_KEY));
+const SCHEME_HTTP = TLS_ENABLED ? 'https' : 'http';
+const SCHEME_WS   = TLS_ENABLED ? 'wss'   : 'ws';
 
 // WebSocket keepalive. Без этих ping'ов TCP-сокет может «тихо умереть»
 // от idle-timeout'ов NAT/прокси/мобильных операторов: обе стороны считают
@@ -28,7 +40,7 @@ const VERSION = '1.1.0';
 // frontend-кода ничего не требуется.
 const HEARTBEAT_INTERVAL_MS = Number(process.env.AGENT_PRO_BRIDGE_PING_MS || 25_000);
 
-const httpServer = http.createServer((req, res) => {
+const requestHandler = (req, res) => {
   // CORS для health-check из браузера
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
@@ -36,12 +48,16 @@ const httpServer = http.createServer((req, res) => {
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, service: 'agent-pro-bridge', version: VERSION }));
+    res.end(JSON.stringify({ ok: true, service: 'agent-pro-bridge', version: VERSION, tls: TLS_ENABLED }));
     return;
   }
   res.writeHead(404, { 'Content-Type': 'text/plain' });
   res.end('Not found');
-});
+};
+
+const httpServer = TLS_ENABLED
+  ? https.createServer({ cert: fs.readFileSync(TLS_CERT), key: fs.readFileSync(TLS_KEY) }, requestHandler)
+  : http.createServer(requestHandler);
 
 const wss = new WebSocketServer({ server: httpServer });
 
@@ -149,8 +165,12 @@ wss.on('connection', (ws, req) => {
 });
 
 httpServer.listen(PORT, HOST, () => {
-  console.log(`agent-pro-bridge ${VERSION} listening on http://${HOST}:${PORT}`);
-  console.log(`  WebSocket: ws://${HOST}:${PORT}`);
-  console.log(`  Health:    http://${HOST}:${PORT}/health`);
+  console.log(`agent-pro-bridge ${VERSION} listening on ${SCHEME_HTTP}://${HOST}:${PORT} (TLS=${TLS_ENABLED ? 'on' : 'off'})`);
+  console.log(`  WebSocket: ${SCHEME_WS}://${HOST}:${PORT}`);
+  if (TLS_ENABLED) {
+    console.log(`  TLS cert : ${TLS_CERT}`);
+    console.log(`  TLS key  : ${TLS_KEY}`);
+  }
+  console.log(`  Health:    ${SCHEME_HTTP}://${HOST}:${PORT}/health`);
   console.log(`  Heartbeat: ping every ${HEARTBEAT_INTERVAL_MS} ms`);
 });

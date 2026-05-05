@@ -24,19 +24,32 @@
 const { WebSocketServer } = require('ws');
 const pty  = require('node-pty');
 const { execFile } = require('child_process');
-const http = require('http');
-const url  = require('url');
-const os   = require('os');
+const http  = require('http');
+const https = require('https');
+const fs    = require('fs');
+const url   = require('url');
+const os    = require('os');
 
 const PORT  = parseInt(process.env.PORT  || '8765', 10);
 const TOKEN = process.env.TOKEN || '';   // Пустая строка = без авторизации
 const SHELL = process.env.SHELL || (process.platform === 'win32' ? 'powershell.exe' : 'bash');
 const HOME  = process.env.HOME  || os.homedir();
 
+// ── TLS ─────────────────────────────────────────────────────────────────────
+// Когда run.py поднимает стек по HTTPS, он пробрасывает пути к сертификату и
+// ключу через TLS_CERT/TLS_KEY. Если они есть и файлы существуют — стартуем
+// HTTPS-сервер (и WebSocket соответственно становится wss://). Иначе работает
+// старый сценарий с обычным HTTP/WS.
+const TLS_CERT = process.env.TLS_CERT || '';
+const TLS_KEY  = process.env.TLS_KEY  || '';
+const TLS_ENABLED = !!(TLS_CERT && TLS_KEY && fs.existsSync(TLS_CERT) && fs.existsSync(TLS_KEY));
+const SCHEME_HTTP = TLS_ENABLED ? 'https' : 'http';
+const SCHEME_WS   = TLS_ENABLED ? 'wss'   : 'ws';
+
 // ──────────────────────────────────────────────────────────────────────────────
-// HTTP healthcheck + CORS preflight
+// HTTP/HTTPS healthcheck + CORS preflight
 // ──────────────────────────────────────────────────────────────────────────────
-const httpServer = http.createServer((req, res) => {
+const requestHandler = (req, res) => {
   res.setHeader('Access-Control-Allow-Origin',  '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', '*');
@@ -44,8 +57,14 @@ const httpServer = http.createServer((req, res) => {
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
   res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ ok: true, server: 'agent-terminal', version: '1.0' }));
-});
+  res.end(JSON.stringify({
+    ok: true, server: 'agent-terminal', version: '1.0', tls: TLS_ENABLED,
+  }));
+};
+
+const httpServer = TLS_ENABLED
+  ? https.createServer({ cert: fs.readFileSync(TLS_CERT), key: fs.readFileSync(TLS_KEY) }, requestHandler)
+  : http.createServer(requestHandler);
 
 // ──────────────────────────────────────────────────────────────────────────────
 // WebSocket server
@@ -176,13 +195,14 @@ httpServer.listen(PORT, () => {
   const ifaces = Object.values(os.networkInterfaces())
     .flat().filter(i => !i.internal && i.family === 'IPv4').map(i => i.address);
 
-  console.log('\n🟢 Agent Terminal Server запущен\n');
-  console.log(`   Интерактивный:   ws://localhost:${PORT}/term`);
-  console.log(`   Команды (exec):  ws://localhost:${PORT}/exec`);
+  console.log(`\n🟢 Agent Terminal Server запущен (TLS=${TLS_ENABLED ? 'on' : 'off'})\n`);
+  console.log(`   Интерактивный:   ${SCHEME_WS}://localhost:${PORT}/term`);
+  console.log(`   Команды (exec):  ${SCHEME_WS}://localhost:${PORT}/exec`);
+  console.log(`   Healthcheck:     ${SCHEME_HTTP}://localhost:${PORT}/`);
   if (ifaces.length) {
     console.log(`\n   Внешние IP:`);
     ifaces.forEach(ip => {
-      console.log(`     ws://${ip}:${PORT}/term  |  ws://${ip}:${PORT}/exec`);
+      console.log(`     ${SCHEME_WS}://${ip}:${PORT}/term  |  ${SCHEME_WS}://${ip}:${PORT}/exec`);
     });
   }
   if (TOKEN) {
@@ -190,6 +210,10 @@ httpServer.listen(PORT, () => {
   } else {
     console.log(`\n   ⚠️  Токен не задан — сервер открыт без авторизации`);
     console.log(`      Задайте:  TOKEN=мойпароль node server.js`);
+  }
+  if (TLS_ENABLED) {
+    console.log(`\n   TLS cert: ${TLS_CERT}`);
+    console.log(`   TLS key : ${TLS_KEY}`);
   }
   console.log('');
 });

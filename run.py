@@ -40,6 +40,7 @@ import shutil
 import signal
 import socket
 import socketserver
+import ssl
 import subprocess
 import sys
 import threading
@@ -48,6 +49,8 @@ from collections import deque
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT))
+from tls_utils import ensure_cert, is_tls_enabled  # noqa: E402
 
 # ── Куда складываем state-файл прошлого запуска (PID/PGID детей). ────────────
 # Используем тот же RUN_DIR, что и start.sh (~/.cache/chat-stack), чтобы внешний
@@ -67,6 +70,18 @@ HOST = os.environ.get("HOST", "0.0.0.0")
 # другой комп в LAN, туннель). Если нужно жёстко ограничить только локалхостом —
 # задайте AGENT_PRO_BRIDGE_HOST=127.0.0.1 (или HOST=127.0.0.1 для всех сервисов).
 BRIDGE_HOST = os.environ.get("AGENT_PRO_BRIDGE_HOST", HOST)
+
+# ── TLS ──────────────────────────────────────────────────────────────────────
+# По умолчанию включаем HTTPS/WSS на всех четырёх сервисах одновременно —
+# иначе браузер ругается на mixed-content (https-страница + ws://-сокеты
+# нельзя). Сертификаты: либо свои (AGENT_PRO_TLS_CERT/KEY), либо самоподписанная
+# пара в ~/.cache/chat-stack/tls/. Отключение: AGENT_PRO_TLS=0 (для случая
+# reverse-proxy на nginx/Caddy, который сам терминирует TLS).
+TLS_ENABLED = is_tls_enabled()
+TLS_CERT_PATH: Path | None = None
+TLS_KEY_PATH: Path | None = None
+SCHEME_HTTP = "https" if TLS_ENABLED else "http"
+SCHEME_WS = "wss" if TLS_ENABLED else "ws"
 
 # ── HTTP Basic Auth для frontend ─────────────────────────────────────────────
 # Дефолтные креды по просьбе владельца проекта; меняются через env. Чтобы
@@ -315,11 +330,17 @@ def banner() -> None:
     log("system", "─" * 64)
     log("system", "Agent Pro — единый запуск (run.py)")
     log("system", "─" * 64)
-    log("system", f"Frontend       : http://localhost:{FRONTEND_PORT}")
-    log("system", f"Workspace API  : http://localhost:{WORKSPACE_PORT}/ws/ping")
-    log("system", f"Terminal (ws)  : ws://localhost:{TERM_PORT}/term  | /exec")
+    log("system", f"Frontend       : {SCHEME_HTTP}://localhost:{FRONTEND_PORT}")
+    log("system", f"Workspace API  : {SCHEME_HTTP}://localhost:{WORKSPACE_PORT}/ws/ping")
+    log("system", f"Terminal (ws)  : {SCHEME_WS}://localhost:{TERM_PORT}/term  | /exec")
     bridge_display = BRIDGE_HOST if BRIDGE_HOST not in ("0.0.0.0", "::", "") else "localhost"
-    log("system", f"MCP bridge (ws): ws://{bridge_display}:{BRIDGE_PORT}")
+    log("system", f"MCP bridge (ws): {SCHEME_WS}://{bridge_display}:{BRIDGE_PORT}")
+    if TLS_ENABLED:
+        log("system", f"TLS            : ВКЛЮЧЕН (cert={TLS_CERT_PATH})")
+        log("system", "                 Самоподписанный → браузер покажет «Подключение не защищено».")
+        log("system", "                 Подложите свой через AGENT_PRO_TLS_CERT/KEY либо AGENT_PRO_TLS=0.")
+    else:
+        log("system", "TLS            : ВЫКЛЮЧЕН (AGENT_PRO_TLS=0). Все сервисы на http/ws.")
     ab = shutil.which("agent-browser")
     if ab:
         log("system", f"agent-browser  : {ab} (browser_action в чате готов)")
@@ -463,23 +484,26 @@ def _runtime_config_payload(host_for_browser: str) -> dict:
     """Значения, которые index.html подхватит как window.AGENT_PRO_DEFAULTS.
 
     Используются как нативные дефолты для полей «Терминал» и «Файловая система»
-    в настройках, чтобы из коробки работало подключение на ws://<host>:<TERM_PORT>
-    и http://<host>:<WORKSPACE_PORT> без ручного ввода.
+    в настройках, чтобы из коробки работало подключение на ws[s]://<host>:<TERM_PORT>
+    и http[s]://<host>:<WORKSPACE_PORT> без ручного ввода. Схема выбирается по
+    флагу TLS_ENABLED — все четыре сервиса живут либо все на https/wss,
+    либо все на http/ws.
     """
     # Если бридж жёстко привязан к loopback (AGENT_PRO_BRIDGE_HOST=127.0.0.1) —
     # отдаём его как есть; иначе строим URL относительно того хоста, по которому
     # пришёл запрос на frontend (так же, как для terminal/workspace).
     if BRIDGE_HOST in ("", "0.0.0.0", "::"):
-        bridge_url = f"ws://{host_for_browser}:{BRIDGE_PORT}"
+        bridge_url = f"{SCHEME_WS}://{host_for_browser}:{BRIDGE_PORT}"
     else:
-        bridge_url = f"ws://{BRIDGE_HOST}:{BRIDGE_PORT}"
+        bridge_url = f"{SCHEME_WS}://{BRIDGE_HOST}:{BRIDGE_PORT}"
     return {
-        "termUrl": f"ws://{host_for_browser}:{TERM_PORT}",
-        "wsApiUrl": f"http://{host_for_browser}:{WORKSPACE_PORT}",
+        "termUrl": f"{SCHEME_WS}://{host_for_browser}:{TERM_PORT}",
+        "wsApiUrl": f"{SCHEME_HTTP}://{host_for_browser}:{WORKSPACE_PORT}",
         "bridgeUrl": bridge_url,
         "termPort": TERM_PORT,
         "wsApiPort": WORKSPACE_PORT,
         "bridgePort": BRIDGE_PORT,
+        "tls": bool(TLS_ENABLED),
     }
 
 
@@ -633,8 +657,30 @@ class FrontendServer(threading.Thread):
         if self.httpd is None:
             log("system", f"frontend: не удалось занять порт {self.port}: {last_exc}")
             return
+        # Оборачиваем сокет в TLS, если включено шифрование. http.server
+        # с ssl-wrapped сокетом работает без изменений — SimpleHTTPRequestHandler
+        # и наследники используют self.connection и self.rfile/self.wfile,
+        # которые будут SSLSocket-обёртками.
+        if TLS_ENABLED and TLS_CERT_PATH is not None and TLS_KEY_PATH is not None:
+            try:
+                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                ctx.load_cert_chain(certfile=str(TLS_CERT_PATH), keyfile=str(TLS_KEY_PATH))
+                # ALPN: браузер сам выберёт http/1.1; оставляем простой список.
+                try:
+                    ctx.set_alpn_protocols(["http/1.1"])
+                except (NotImplementedError, ssl.SSLError):
+                    pass
+                self.httpd.socket = ctx.wrap_socket(self.httpd.socket, server_side=True)
+            except (ssl.SSLError, OSError) as exc:
+                log("system", f"frontend: не удалось включить TLS: {exc}")
+                try:
+                    self.httpd.server_close()
+                except Exception:
+                    pass
+                self.httpd = None
+                return
         self.bind_ok.set()
-        log("frontend", f"serving {ROOT} on http://{self.host}:{self.port}")
+        log("frontend", f"serving {ROOT} on {SCHEME_HTTP}://{self.host}:{self.port}")
         try:
             self.httpd.serve_forever()
         except Exception as exc:
@@ -672,24 +718,44 @@ def find_python() -> str:
 # ── main ─────────────────────────────────────────────────────────────────────
 def _build_services() -> list[Service]:
     services: list[Service] = []
+
+    workspace_cmd = [
+        find_python(), "wsapi_server.py",
+        "--host", HOST, "--port", str(WORKSPACE_PORT),
+    ]
+    if TLS_ENABLED and TLS_CERT_PATH and TLS_KEY_PATH:
+        workspace_cmd += ["--cert", str(TLS_CERT_PATH), "--key", str(TLS_KEY_PATH)]
     services.append(Service(
         name="workspace",
-        cmd=[find_python(), "wsapi_server.py", "--host", HOST, "--port", str(WORKSPACE_PORT)],
+        cmd=workspace_cmd,
         cwd=ROOT,
         ports=[WORKSPACE_PORT],
     ))
+
+    terminal_env = {"PORT": str(TERM_PORT)}
+    if TLS_ENABLED and TLS_CERT_PATH and TLS_KEY_PATH:
+        terminal_env["TLS_CERT"] = str(TLS_CERT_PATH)
+        terminal_env["TLS_KEY"] = str(TLS_KEY_PATH)
     services.append(Service(
         name="terminal",
         cmd=["node", "server.js"],
         cwd=ROOT,
-        env={"PORT": str(TERM_PORT)},
+        env=terminal_env,
         ports=[TERM_PORT],
     ))
+
+    bridge_env = {
+        "AGENT_PRO_BRIDGE_HOST": BRIDGE_HOST,
+        "AGENT_PRO_BRIDGE_PORT": str(BRIDGE_PORT),
+    }
+    if TLS_ENABLED and TLS_CERT_PATH and TLS_KEY_PATH:
+        bridge_env["TLS_CERT"] = str(TLS_CERT_PATH)
+        bridge_env["TLS_KEY"] = str(TLS_KEY_PATH)
     services.append(Service(
         name="bridge",
         cmd=["node", "agent-pro-bridge.mjs"],
         cwd=ROOT / "bridge",
-        env={"AGENT_PRO_BRIDGE_HOST": BRIDGE_HOST, "AGENT_PRO_BRIDGE_PORT": str(BRIDGE_PORT)},
+        env=bridge_env,
         ports=[BRIDGE_PORT],
     ))
     return services
@@ -720,6 +786,18 @@ def main(argv: list[str] | None = None) -> int:
         cleanup_stale_children()
         log("system", "cleanup-only: готово")
         return 0
+
+    # ── TLS: подготовить cert/key ДО баннера, чтобы он показал актуальный путь.
+    # При AGENT_PRO_TLS=0 пропускаем — всё работает по http/ws как раньше.
+    global TLS_CERT_PATH, TLS_KEY_PATH, TLS_ENABLED, SCHEME_HTTP, SCHEME_WS
+    if TLS_ENABLED:
+        try:
+            TLS_CERT_PATH, TLS_KEY_PATH = ensure_cert()
+        except (RuntimeError, OSError, FileNotFoundError) as exc:
+            log("system", f"TLS: не смог подготовить сертификат — откатываюсь на HTTP. Причина: {exc}")
+            TLS_ENABLED = False
+            SCHEME_HTTP = "http"
+            SCHEME_WS = "ws"
 
     banner()
 

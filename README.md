@@ -4,10 +4,10 @@
 
 | Компонент | Что делает | Адрес по умолчанию |
 | --- | --- | --- |
-| **Frontend** (`index.html`) | Сам чат-интерфейс, работает в браузере | <http://localhost:8080> |
-| **Workspace API** (`wsapi_server.py`, Flask) | Файловая система агента (`/ws/list`, `/ws/read`, `/ws/write`, …) | <http://localhost:8764> |
-| **Terminal Server** (`server.js`, Node + node-pty) | Удалённый PTY и одноразовые команды для агента | `ws://localhost:8765/term`, `ws://localhost:8765/exec` |
-| **MCP stdio Bridge** (`bridge/agent-pro-bridge.mjs`) | Локальный мост, чтобы браузер мог запускать stdio-MCP-серверы | `ws://127.0.0.1:7777` |
+| **Frontend** (`index.html`) | Сам чат-интерфейс, работает в браузере | <https://localhost:8080> |
+| **Workspace API** (`wsapi_server.py`, Flask) | Файловая система агента (`/ws/list`, `/ws/read`, `/ws/write`, …) | <https://localhost:8764> |
+| **Terminal Server** (`server.js`, Node + node-pty) | Удалённый PTY и одноразовые команды для агента | `wss://localhost:8765/term`, `wss://localhost:8765/exec` |
+| **MCP stdio Bridge** (`bridge/agent-pro-bridge.mjs`) | Локальный мост, чтобы браузер мог запускать stdio-MCP-серверы | `wss://127.0.0.1:7777` |
 | **agent-browser** (CLI, `tools/agent-browser-termux/`) | Persistent Playwright-Chromium для `browser_action` в чате | `~/.local/bin/agent-browser` (или `$PREFIX/bin` на Termux) |
 | **BrowserAct** (`browser-act-cli`) | Stealth/Real Chrome/CAPTCHA/network browser automation для `browser_act` и встроенного skill `browser-act` | `~/.local/bin/browser-act` |
 
@@ -31,6 +31,9 @@
 * **uv** для автоматической установки BrowserAct CLI (`browser-act-cli`). Если `uv`
   отсутствует, стек запустится, но инструмент `browser_act` будет недоступен до
   `uv tool install browser-act-cli --python 3.12`.
+* **openssl** (в PATH) — нужен для одноразовой генерации самоподписанного
+  TLS-сертификата. Ubuntu/Debian: идёт в комплекте; Termux: `pkg install
+  openssl-tool`. Если не нужен HTTPS — запустите `AGENT_PRO_TLS=0 bash start.sh`.
 
 ```bash
 git clone https://github.com/RamadanIU/Chat.git
@@ -70,7 +73,57 @@ npm start
   первой успешной установки).
 * `bash start.sh --help` — показать встроенную справку.
 
-После запуска откройте в браузере <http://localhost:8080> — это и есть UI чата.
+После запуска откройте в браузере <https://localhost:8080> — это и есть UI чата.
+При первом открытии браузер покажет «Подключение не защищено» — это ожидаемо
+для самоподписанного сертификата (см. раздел [HTTPS / TLS](#https--tls)).
+
+### HTTPS / TLS
+
+Стек по умолчанию поднимается по **HTTPS/WSS на всех четырёх сервисах**
+одновременно — иначе браузер режет mixed-content (https-страница + ws://-сокеты
+нельзя). Сертификаты выбираются в следующем порядке:
+
+1. Пользовательские файлы, если заданы `AGENT_PRO_TLS_CERT` и `AGENT_PRO_TLS_KEY`.
+2. Иначе — автосгенерированный самоподписанный серт в `~/.cache/chat-stack/tls/`
+   (переопределяется через `AGENT_PRO_TLS_DIR`). Генерация — через системный
+   `openssl`, SAN охватывают `localhost`, `127.0.0.1`, `::1`, hostname и все
+   локальные IPv4-интерфейсы. Регенерируется только если файлов нет; чтобы
+   перевыпустить — удалите `cert.pem`/`key.pem` вручную.
+
+#### Браузер ругается на самоподписанный серт — что делать?
+
+* **Простой путь**: на экране «NET::ERR_CERT_AUTHORITY_INVALID» в Chrome нажмите
+  «Дополнительные» → ·Open `localhost` (unsafe)·. Для WebSocket-подключений
+  (terminal/bridge/wsapi) один раз откройте их по https в соседней вкладке
+  (напр. <https://localhost:8765/>) и подтвердите исключение — дальше wss://
+  будет работать.
+* **Правильный путь**: подложите свой сертификат через [mkcert][mkcert]
+  (локальный trusted CA) или [Let's Encrypt][le] и укажите их в
+  `AGENT_PRO_TLS_CERT` / `AGENT_PRO_TLS_KEY`:
+
+  ```bash
+  mkcert -install
+  mkcert -cert-file ~/.cache/chat-stack/tls/cert.pem \
+         -key-file  ~/.cache/chat-stack/tls/key.pem \
+         localhost 127.0.0.1 ::1
+  bash start.sh
+  ```
+
+* **Не нужен HTTPS** (напр. вы ставите nginx/Caddy reverse-proxy, который
+  сам терминирует TLS): запустите `AGENT_PRO_TLS=0 bash start.sh` — все четыре
+  сервиса вернутся на старые http/ws.
+
+[mkcert]: https://github.com/FiloSottile/mkcert
+[le]: https://letsencrypt.org/
+
+#### Переменные окружения
+
+| Variable | Default | Пояснение |
+| --- | --- | --- |
+| `AGENT_PRO_TLS` | `1` | `0/false/no/off` — отключить TLS для всех 4 сервисов. |
+| `AGENT_PRO_TLS_CERT` | (авто) | PEM-серт (chain) для HTTPS. Используется вместе с `AGENT_PRO_TLS_KEY`. |
+| `AGENT_PRO_TLS_KEY` | (авто) | PEM-ключ. |
+| `AGENT_PRO_TLS_DIR` | `~/.cache/chat-stack/tls` | Куда класть автосгенерированную пару. |
 
 ### BrowserAct в Agent Pro
 
